@@ -72,6 +72,8 @@ OUTPUT_DIR=data/backtest/my-run npm run paper:backtest -- data/paper/my-run/mark
   - `relaxed-rules`: wider return ranges, 1.5x volume acceleration, 15 buyers, 55% buy share, 25% single-bucket limit, 5 minute minimum age.
   - `loose-rules`: wider still, with a 10 real SOL reserve filter.
   - `relaxed-rules-2x-costs`: the relaxed rules with doubled latency, latency slippage, priority fee, and migration penalty.
+  - `early-entry`: buys 1 to 3 minutes after launch. It needs at least 15 trades, 10 distinct buyers, 65% buy volume, positive net buying in the last 30 seconds, 2 to 20 real SOL in the curve, and no creator sell. Holder limits are wider (10% / 40% / 10%), slippage is 2%, and exits are +25% take profit, -12% stop, a 10% trailing stop after +15%, and a 5 minute maximum hold.
+  - `early-entry-2x-costs`: the early rules with doubled latency, latency slippage, and priority fee.
 - Only the approved rules may ever go live. The other rule sets are for paper observation.
 - A few hours of results do not satisfy the release gates and do not predict future results.
 

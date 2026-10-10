@@ -1,6 +1,16 @@
 import { meetsCostHurdle } from "../../../packages/market/src/index.js";
 import { assessEntryRisk } from "../../../packages/risk/src/index.js";
-import { APPROVED_MOMENTUM_RULES, evaluateExit, evaluateMomentumEntry, type EntryDecision, type MomentumRules, rankMomentumCandidates } from "../../../packages/strategy/src/index.js";
+import {
+  APPROVED_EXIT_RULES,
+  APPROVED_MOMENTUM_RULES,
+  type EntryDecision,
+  evaluateExit,
+  evaluateMomentumEntry,
+  type ExitRules,
+  type MomentumRules,
+  rankMomentumCandidates,
+} from "../../../packages/strategy/src/index.js";
+import { EARLY_ENTRY_RULES, type EarlyEntryRules, evaluateEarlyEntry } from "./early.js";
 import {
   completedBuckets,
   holderProfile,
@@ -40,6 +50,12 @@ export interface PaperTraderConfig {
   rentRefundedOnExit: boolean;
   /** Entry thresholds. Anything other than the approved rules is paper-only. */
   entryRules: Readonly<MomentumRules>;
+  /** "momentum" is the approved strategy. "early" is paper-only. */
+  strategy: "momentum" | "early";
+  earlyRules: Readonly<EarlyEntryRules>;
+  exitRules: Readonly<ExitRules>;
+  /** Gross profit target that every estimated cost plus margin must fit under. */
+  grossTargetBps: number;
 }
 
 export const BASE_CONFIG: Omit<PaperTraderConfig, "name" | "minRealSolReserves"> = {
@@ -64,6 +80,10 @@ export const BASE_CONFIG: Omit<PaperTraderConfig, "name" | "minRealSolReserves">
   tokenAccountRentSol: 0.00207,
   rentRefundedOnExit: true,
   entryRules: APPROVED_MOMENTUM_RULES,
+  strategy: "momentum",
+  earlyRules: EARLY_ENTRY_RULES,
+  exitRules: APPROVED_EXIT_RULES,
+  grossTargetBps: 1_500,
 };
 
 interface PendingOrder {
@@ -298,7 +318,7 @@ export class PaperTrader {
         peakNetExecutableValueLamports: toLamports(position.peakValueSol),
         openedAt: new Date(position.openedAt),
         now: new Date(now),
-      });
+      }, this.config.exitRules);
       const reasons: string[] = [...decision.reasons];
       if (token?.migrated) reasons.push("ROUTE_MIGRATED");
       if (this.halted) reasons.push("DAILY_LOSS_LIQUIDATION");
@@ -315,26 +335,12 @@ export class PaperTrader {
       return [];
     }
     const needsAuthority: string[] = [];
-    const candidates: Array<{ mint: string; decision: EntryDecision; token: TokenState }> = [];
+    const candidates: Array<{ mint: string; token: TokenState; decision?: EntryDecision; score: number }> = [];
     for (const token of this.market.tokens.values()) {
       if (token.migrated || this.isActive(token.mint)) continue;
       if ((this.cooldownUntil.get(token.mint) ?? 0) > now) continue;
-      if (now - token.createdAt < this.config.entryRules.minimumTokenAgeMs) continue;
-      // Cheap prefilter: the distinct-buyer rule needs at least this many buys anyway.
-      const recentBuys = countRecentBuys(token, now - 5 * 60_000);
-      if (recentBuys < this.config.entryRules.minDistinctBuyers5m) continue;
-      const window = completedBuckets(token, now);
-      const decision = evaluateMomentumEntry({
-        mint: token.mint,
-        tokenCreatedAt: new Date(token.createdAt),
-        decisionAt: new Date(window.decisionAt),
-        completedBuckets: window.buckets,
-        distinctBuyers5m: window.distinctBuyers,
-      }, this.config.entryRules);
-      if (decision.action !== "enter") {
-        for (const reason of decision.reasons) this.count(reason);
-        continue;
-      }
+      const signal = this.config.strategy === "early" ? this.earlySignal(token, now) : this.momentumSignal(token, now);
+      if (!signal) continue;
       const rejection = this.safetyRejection(token);
       if (rejection) {
         this.count(rejection);
@@ -350,10 +356,13 @@ export class PaperTrader {
         this.count("MINT_AUTHORITY_REJECTED");
         continue;
       }
-      candidates.push({ mint: token.mint, decision, token });
+      candidates.push({ mint: token.mint, token, ...signal });
     }
 
-    for (const candidate of rankMomentumCandidates(candidates)) {
+    const ranked = this.config.strategy === "early"
+      ? candidates.slice().sort((left, right) => right.score - left.score || left.mint.localeCompare(right.mint))
+      : rankMomentumCandidates(candidates.flatMap((candidate) => (candidate.decision ? [{ ...candidate, decision: candidate.decision }] : [])));
+    for (const candidate of ranked) {
       const token = candidate.token;
       const sizingEquity = Math.min(equity, this.dayOpenEquity);
       const sizeSol = (sizingEquity * this.config.positionBps) / 10_000;
@@ -373,6 +382,7 @@ export class PaperTrader {
         slippageAllowanceBps: this.config.slippageBps,
         priorityFeeBps: txFeeBps,
         latencyCostBps: this.config.latencySlippageBps * 2,
+        grossTargetBps: this.config.grossTargetBps,
       });
       if (!hurdle.allowed) {
         this.count("COST_HURDLE_NOT_MET");
@@ -414,6 +424,36 @@ export class PaperTrader {
       this.pending.push({ side: "buy", mint: token.mint, fillAt: now + this.config.latencyMs, sizeSol, tokens: 0, quotedOutput: buy.tokensOut, reasons: ["MOMENTUM_ENTRY"] });
     }
     return needsAuthority;
+  }
+
+  private momentumSignal(token: TokenState, now: number): { decision: EntryDecision; score: number } | undefined {
+    if (now - token.createdAt < this.config.entryRules.minimumTokenAgeMs) return undefined;
+    // Cheap prefilter: the distinct-buyer rule needs at least this many buys anyway.
+    if (countRecentBuys(token, now - 5 * 60_000) < this.config.entryRules.minDistinctBuyers5m) return undefined;
+    const window = completedBuckets(token, now);
+    const decision = evaluateMomentumEntry({
+      mint: token.mint,
+      tokenCreatedAt: new Date(token.createdAt),
+      decisionAt: new Date(window.decisionAt),
+      completedBuckets: window.buckets,
+      distinctBuyers5m: window.distinctBuyers,
+    }, this.config.entryRules);
+    if (decision.action !== "enter") {
+      for (const reason of decision.reasons) this.count(reason);
+      return undefined;
+    }
+    return { decision, score: decision.features?.volumeRatio ?? 0 };
+  }
+
+  private earlySignal(token: TokenState, now: number): { score: number } | undefined {
+    const age = now - token.createdAt;
+    if (age < this.config.earlyRules.minAgeMs || age > this.config.earlyRules.maxAgeMs) return undefined;
+    const decision = evaluateEarlyEntry(token, now, this.config.earlyRules);
+    if (decision.action !== "enter") {
+      for (const reason of decision.reasons) this.count(reason);
+      return undefined;
+    }
+    return { score: decision.score };
   }
 
   private safetyRejection(token: TokenState): string | undefined {
@@ -487,12 +527,42 @@ export const LOOSE_MOMENTUM_RULES: Readonly<MomentumRules> = Object.freeze({
   maxFiveSecondReturnBps: 4_000,
 });
 
+/** Faster exits for the early strategy: +25% target, -12% stop, 5 minute maximum hold. */
+export const EARLY_EXIT_RULES: Readonly<ExitRules> = Object.freeze({
+  takeProfitBps: 2_500,
+  stopLossBps: 1_200,
+  trailingActivationBps: 1_500,
+  trailingDrawdownBps: 1_000,
+  maxHoldMs: 5 * 60_000,
+});
+
 export function defaultVariants(startingBalanceSol = BASE_CONFIG.startingBalanceSol): PaperTraderConfig[] {
   const base = { ...BASE_CONFIG, startingBalanceSol, feeReserveSol: Math.min(BASE_CONFIG.feeReserveSol, startingBalanceSol * 0.05) };
+  const early: Omit<PaperTraderConfig, "name"> = {
+    ...base,
+    strategy: "early",
+    minRealSolReserves: EARLY_ENTRY_RULES.minRealSol,
+    // Early tokens are thin and concentrated. These limits are wider than the approved 5% / 25% / 5%.
+    maxHolderPct: 10,
+    maxTop10Pct: 40,
+    maxCreatorPct: 10,
+    slippageBps: 200,
+    cooldownMs: 24 * 60 * 60_000,
+    exitRules: EARLY_EXIT_RULES,
+    grossTargetBps: 2_500,
+  };
   return [
     { ...base, name: "approved-rules", minRealSolReserves: 20 },
     { ...base, name: "relaxed-rules", minRealSolReserves: 20, entryRules: RELAXED_MOMENTUM_RULES },
     { ...base, name: "loose-rules", minRealSolReserves: 10, entryRules: LOOSE_MOMENTUM_RULES },
+    { ...early, name: "early-entry" },
+    {
+      ...early,
+      name: "early-entry-2x-costs",
+      latencyMs: BASE_CONFIG.latencyMs * 2,
+      latencySlippageBps: BASE_CONFIG.latencySlippageBps * 2,
+      priorityFeeSol: BASE_CONFIG.priorityFeeSol * 2,
+    },
     {
       ...base,
       name: "relaxed-rules-2x-costs",

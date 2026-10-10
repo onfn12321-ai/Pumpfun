@@ -171,7 +171,24 @@ export interface ExitInput {
   now: Date;
 }
 
-export function evaluateExit(input: ExitInput): ExitDecision {
+/** Exit thresholds. Live trading uses only APPROVED_EXIT_RULES. */
+export interface ExitRules {
+  takeProfitBps: number;
+  stopLossBps: number;
+  trailingActivationBps: number;
+  trailingDrawdownBps: number;
+  maxHoldMs: number;
+}
+
+export const APPROVED_EXIT_RULES: Readonly<ExitRules> = Object.freeze({
+  takeProfitBps: 1_500,
+  stopLossBps: 800,
+  trailingActivationBps: 800,
+  trailingDrawdownBps: 600,
+  maxHoldMs: 20 * 60_000,
+});
+
+export function evaluateExit(input: ExitInput, rules: Readonly<ExitRules> = APPROVED_EXIT_RULES): ExitDecision {
   if (input.entryCostLamports <= 0n) throw new Error("entry cost must be positive");
   const netReturnBps = Number(((input.netExecutableValueLamports - input.entryCostLamports) * 10_000n) / input.entryCostLamports);
   const peakReturnBps = Number(((input.peakNetExecutableValueLamports - input.entryCostLamports) * 10_000n) / input.entryCostLamports);
@@ -179,9 +196,9 @@ export function evaluateExit(input: ExitInput): ExitDecision {
     ? 10_000
     : Number(((input.peakNetExecutableValueLamports - input.netExecutableValueLamports) * 10_000n) / input.peakNetExecutableValueLamports);
   const reasons: ExitReason[] = [];
-  if (netReturnBps >= 1_500) reasons.push("TAKE_PROFIT");
-  if (netReturnBps <= -800) reasons.push("STOP_LOSS");
-  if (peakReturnBps >= 800 && peakDrawdownBps >= 600) reasons.push("TRAILING_STOP");
-  if (input.now.getTime() - input.openedAt.getTime() >= 20 * 60_000) reasons.push("MAX_HOLD_TIME");
+  if (netReturnBps >= rules.takeProfitBps) reasons.push("TAKE_PROFIT");
+  if (netReturnBps <= -rules.stopLossBps) reasons.push("STOP_LOSS");
+  if (peakReturnBps >= rules.trailingActivationBps && peakDrawdownBps >= rules.trailingDrawdownBps) reasons.push("TRAILING_STOP");
+  if (input.now.getTime() - input.openedAt.getTime() >= rules.maxHoldMs) reasons.push("MAX_HOLD_TIME");
   return { action: reasons.length > 0 ? "exit" : "hold", reasons };
 }
