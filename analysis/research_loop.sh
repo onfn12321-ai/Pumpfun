@@ -8,7 +8,7 @@ MIN_HOURS="${MIN_HOURS:-6}"
 mkdir -p data/research
 while :; do
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  files=(data/recordings/live05-full.ndjson data/recordings/live05-v3.ndjson data/recordings/live05-v4-latest.ndjson data/recordings/long-24h.ndjson)
+  files=(data/recordings/live05-full.ndjson data/recordings/live05-v3.ndjson data/recordings/live05-v4-latest.ndjson data/recordings/long-24h*.ndjson)
   [ -f data/paper/live-05sol-v4/market.ndjson ] && files+=(data/paper/live-05sol-v4/market.ndjson)
   python3 analysis/hypotheses.py "data/research/$stamp" "${files[@]}" > /dev/null 2>&1
   cp "data/research/$stamp/summary.md" data/research/latest.md
