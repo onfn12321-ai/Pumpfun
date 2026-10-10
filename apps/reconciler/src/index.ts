@@ -2,6 +2,7 @@ import type { DurableRepository, PendingAttempt } from "../../../packages/storag
 
 export interface ChainTransaction {
   signature: string;
+  messageHash: string;
   commitment: "confirmed" | "finalized";
   failed: boolean;
   mint: string;
@@ -28,7 +29,13 @@ export class Reconciler {
       await this.repository.transitionAttempt(pending.attempt.id, pending.attempt.state, "expired");
       return "expired";
     }
-    if (chain.wallet !== pending.intent.wallet || chain.mint !== pending.intent.mint) return "mismatch";
+    const signatureMatches = pending.attempt.signature !== null && chain.signature === pending.attempt.signature;
+    const messageMatches = pending.attempt.messageHash !== null && chain.messageHash === pending.attempt.messageHash;
+    if (
+      chain.wallet !== pending.intent.wallet
+      || chain.mint !== pending.intent.mint
+      || (!signatureMatches && !messageMatches)
+    ) return "mismatch";
     if (chain.failed) {
       await this.repository.transitionAttempt(pending.attempt.id, pending.attempt.state, "failed", { error: "chain transaction failed" });
       return "failed";

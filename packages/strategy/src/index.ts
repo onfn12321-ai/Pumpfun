@@ -62,9 +62,11 @@ function hasCompleteHistory(buckets: readonly MarketBucket[], decisionAt: Date):
 export function calculateMomentumFeatures(input: MomentumInput): MomentumFeatures | undefined {
   const buckets = input.completedBuckets;
   if (!hasCompleteHistory(buckets, input.decisionAt)) return undefined;
+  const lastMinuteStartIndex = REQUIRED_HISTORY_BUCKETS - (60_000 / FIVE_SECOND_BUCKET_MS);
+  const lastIndex = REQUIRED_HISTORY_BUCKETS - 1;
   const first = buckets[0]!;
-  const firstLastMinute = buckets[48]!;
-  const last = buckets[59]!;
+  const firstLastMinute = buckets[lastMinuteStartIndex]!;
+  const last = buckets[lastIndex]!;
   const return60sBps = returnBps(firstLastMinute.openPriceSol, last.closePriceSol);
   const return5mBps = returnBps(first.openPriceSol, last.closePriceSol);
   if (return60sBps === undefined || return5mBps === undefined) return undefined;
@@ -78,7 +80,7 @@ export function calculateMomentumFeatures(input: MomentumInput): MomentumFeature
     const bucket = buckets[index]!;
     const volume = bucket.buyVolumeSol + bucket.sellVolumeSol;
     if (!Number.isFinite(volume) || volume < 0) return undefined;
-    if (index < 48) precedingVolume += volume;
+    if (index < lastMinuteStartIndex) precedingVolume += volume;
     else lastMinuteVolume += volume;
     buyVolume += bucket.buyVolumeSol;
     totalVolume += volume;
