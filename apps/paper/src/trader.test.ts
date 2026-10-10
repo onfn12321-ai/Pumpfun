@@ -109,6 +109,7 @@ describe("pump event decoder", () => {
     const event = decodePumpEvent(payload, "sig", 1);
     expect(event).toMatchObject({
       txType: "create",
+      isMayhemMode: false,
       mint: "334rPvNk48wQEKiVunLDMV8e3HocwuofzXxZburjpump",
       symbol: "NoahAI",
       traderPublicKey: "9E4uxeDmfNHXPJUvraYPHE8YUMCQPjGkp3SCctzAkREH",
@@ -128,6 +129,21 @@ describe("pump event decoder", () => {
     expect(event?.solAmount).toBeGreaterThan(1);
     expect(event?.vSolInBondingCurve).toBeCloseTo(30 + event!.solAmount!, 1);
     expect(event?.tokenAmount).toBeGreaterThan(0);
+  });
+
+  it("marks a recorded mainnet mayhem-mode create as nonstandard", () => {
+    const payload = "G3KpTd7rY3YGAAAARE9PQklFBAAAAERPT0JDAAAAaHR0cHM6Ly9pcGZzLmlvL2lwZnMvUW1TdUViWDFvZzdGTFZVTVhjb21RS1hmSmpDOGN5b2ZRdldyaVdYejhmRVhYWDn1eK0b/ZZUwES9P0V5MzsVV1038umF2frM4/G8YzWvQO+0FbOeKVt3USTonH8Jpy0WAiT4o5MCYuTH//0zVFu8sOwcmghm5wRc8bFJiaPxqV3wZ2BMCk2r7SGXTx8M6byw7ByaCGbnBFzxsUmJo/GpXfBnYEwKTavtIZdPHwzpZGjKagAAAAAAENhH488DAACsI/wGAAAAAHjF+1HRAgAAgMakfo0DAAbd9uHudY/eGEJdvORszdq2GvxNg7kNJ/69+SjYoYv8AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACsI/wGAAAAAAAAAAAAAAAAAA==";
+    const event = decodePumpEvent(payload);
+    expect(event).toMatchObject({ txType: "create", symbol: "DOOB", isMayhemMode: true, pool: "nonstandard" });
+  });
+
+  it("blocks a token whose trade breaks the standard curve invariant", () => {
+    const { market } = qualifyingMarket();
+    market.apply(DECISION - 500, { txType: "sell", mint: MINT, traderPublicKey: "x", solAmount: 0.1, tokenAmount: 1_000, vSolInBondingCurve: 26.9, vTokensInBondingCurve: 1_043_000_000, pool: "pump" });
+    expect(market.tokens.get(MINT)?.invalidCurve).toBe(true);
+    const trader = new PaperTrader({ ...BASE_CONFIG, name: "test", minRealSolReserves: 20 }, market);
+    trader.tick(DECISION, new Map([[MINT, "ok"]]));
+    expect(trader.rejectionCounts.ENTRY_SUBMITTED).toBeUndefined();
   });
 
   it("ignores unknown discriminators and truncated payloads", () => {

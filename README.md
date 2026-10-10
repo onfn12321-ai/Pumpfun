@@ -60,17 +60,19 @@ RUN_ID=my-run DURATION_MINUTES=240 npm run paper:live
 OUTPUT_DIR=data/backtest/my-run npm run paper:backtest -- data/paper/my-run/market.ndjson
 ```
 
-- The market feed is Pump.fun program logs from Solana `logsSubscribe`. The default is the public mainnet endpoint. Set `SOLANA_WS_URL` and `SOLANA_RPC_URL` for a dedicated RPC.
-- The feed sees only tokens created after it starts. A token can trade 10 minutes after the feed sees its creation.
+- The market feed is Pump.fun program logs from Solana `logsSubscribe`. By default it connects to two free endpoints at the same time (Solana public and PublicNode) and removes duplicate events. A gap is recorded only when both connections are down. Set `SOLANA_WS_URLS` (comma-separated) and `SOLANA_RPC_URL` to use a dedicated RPC.
+- The feed sees only tokens created after it starts.
+- Mayhem-mode tokens are excluded. Any token whose trade breaks the standard curve formula (virtual SOL x virtual tokens = 30 x 1,073,000,000) is blocked, because its prices cannot be trusted.
 - Holder shares come from observed curve trades only. Wallet-to-wallet transfers are not seen.
 - Mint and freeze authority checks use `getAccountInfo`. A failed check blocks the entry.
 - Fills use the reserves visible after the modeled latency, the 1.25% trading fee, extra latency slippage, network and priority fees, and the slippage limit. A fill outside the slippage limit fails and costs the network fee.
-- Four portfolios run side by side. Each starts with `STARTING_BALANCE_SOL` paper SOL (default 0.5) and uses the aggressive limits (5% per position, 10% daily loss, 40% exposure). At 0.5 SOL, one position is 0.025 SOL.
-- Each first buy of a token pays a token-account deposit of about 0.00207 SOL. The deposit comes back only if the sell closes the account.
-  - `approved-strict` uses the approved 100 SOL reserve filter. A Pump.fun curve graduates near 85 real SOL, so this portfolio cannot enter on the bonding curve.
-  - `exploratory-20sol` lowers the reserve filter to 20 real SOL. This change is not approved for live use.
-  - `exploratory-20sol-2x-costs` doubles latency, latency slippage, priority fee, and the migration penalty.
-  - `exploratory-20sol-no-refund` assumes the deposit does not come back. At 0.025 SOL per position, the deposit is about 8% of the trade, so the cost hurdle blocks every entry.
+- Each first buy of a token pays a token-account deposit of about 0.00207 SOL. The model assumes the sell closes the account and returns the deposit. If the deposit is lost, the cost hurdle blocks every 0.025 SOL entry.
+- Four paper portfolios run side by side. Each starts with `STARTING_BALANCE_SOL` (default 0.5) and uses the aggressive limits (5% per position, 10% daily loss, 40% exposure):
+  - `approved-rules`: the approved momentum rules, with the reserve filter lowered from 100 to 20 real SOL. A curve graduates near 85 real SOL, so 100 can never pass.
+  - `relaxed-rules`: wider return ranges, 1.5x volume acceleration, 15 buyers, 55% buy share, 25% single-bucket limit, 5 minute minimum age.
+  - `loose-rules`: wider still, with a 10 real SOL reserve filter.
+  - `relaxed-rules-2x-costs`: the relaxed rules with doubled latency, latency slippage, priority fee, and migration penalty.
+- Only the approved rules may ever go live. The other rule sets are for paper observation.
 - A few hours of results do not satisfy the release gates and do not predict future results.
 
 ## Architecture

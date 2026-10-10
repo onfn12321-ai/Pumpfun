@@ -1,6 +1,6 @@
 import { meetsCostHurdle } from "../../../packages/market/src/index.js";
 import { assessEntryRisk } from "../../../packages/risk/src/index.js";
-import { evaluateExit, evaluateMomentumEntry, rankMomentumCandidates, type EntryDecision } from "../../../packages/strategy/src/index.js";
+import { APPROVED_MOMENTUM_RULES, evaluateExit, evaluateMomentumEntry, type EntryDecision, type MomentumRules, rankMomentumCandidates } from "../../../packages/strategy/src/index.js";
 import {
   completedBuckets,
   holderProfile,
@@ -38,6 +38,8 @@ export interface PaperTraderConfig {
   tokenAccountRentSol: number;
   /** True when the sell closes the token account and returns the deposit. */
   rentRefundedOnExit: boolean;
+  /** Entry thresholds. Anything other than the approved rules is paper-only. */
+  entryRules: Readonly<MomentumRules>;
 }
 
 export const BASE_CONFIG: Omit<PaperTraderConfig, "name" | "minRealSolReserves"> = {
@@ -61,6 +63,7 @@ export const BASE_CONFIG: Omit<PaperTraderConfig, "name" | "minRealSolReserves">
   migrationPenaltyBps: 300,
   tokenAccountRentSol: 0.00207,
   rentRefundedOnExit: true,
+  entryRules: APPROVED_MOMENTUM_RULES,
 };
 
 interface PendingOrder {
@@ -316,10 +319,10 @@ export class PaperTrader {
     for (const token of this.market.tokens.values()) {
       if (token.migrated || this.isActive(token.mint)) continue;
       if ((this.cooldownUntil.get(token.mint) ?? 0) > now) continue;
-      if (now - token.createdAt < 10 * 60_000) continue;
-      // Cheap prefilter: at least 20 buys in the last five minutes are required anyway.
+      if (now - token.createdAt < this.config.entryRules.minimumTokenAgeMs) continue;
+      // Cheap prefilter: the distinct-buyer rule needs at least this many buys anyway.
       const recentBuys = countRecentBuys(token, now - 5 * 60_000);
-      if (recentBuys < 20) continue;
+      if (recentBuys < this.config.entryRules.minDistinctBuyers5m) continue;
       const window = completedBuckets(token, now);
       const decision = evaluateMomentumEntry({
         mint: token.mint,
@@ -327,7 +330,7 @@ export class PaperTrader {
         decisionAt: new Date(window.decisionAt),
         completedBuckets: window.buckets,
         distinctBuyers5m: window.distinctBuyers,
-      });
+      }, this.config.entryRules);
       if (decision.action !== "enter") {
         for (const reason of decision.reasons) this.count(reason);
         continue;
@@ -456,20 +459,49 @@ function round(value: number): number {
   return Math.round(value * 1e6) / 1e6;
 }
 
+/**
+ * Looser entry rules for paper observation only. They were chosen from first
+ * principles before any backtest, not fitted to recorded data.
+ */
+export const RELAXED_MOMENTUM_RULES: Readonly<MomentumRules> = Object.freeze({
+  minimumTokenAgeMs: 5 * 60_000,
+  minReturn60sBps: 200,
+  maxReturn60sBps: 2_500,
+  minReturn5mBps: 500,
+  maxReturn5mBps: 8_000,
+  minVolumeRatio: 1.5,
+  minDistinctBuyers5m: 15,
+  minBuyVolumeShareBps: 5_500,
+  maxFiveSecondReturnBps: 2_500,
+});
+
+export const LOOSE_MOMENTUM_RULES: Readonly<MomentumRules> = Object.freeze({
+  minimumTokenAgeMs: 5 * 60_000,
+  minReturn60sBps: 100,
+  maxReturn60sBps: 4_000,
+  minReturn5mBps: 300,
+  maxReturn5mBps: 15_000,
+  minVolumeRatio: 1.2,
+  minDistinctBuyers5m: 10,
+  minBuyVolumeShareBps: 5_000,
+  maxFiveSecondReturnBps: 4_000,
+});
+
 export function defaultVariants(startingBalanceSol = BASE_CONFIG.startingBalanceSol): PaperTraderConfig[] {
   const base = { ...BASE_CONFIG, startingBalanceSol, feeReserveSol: Math.min(BASE_CONFIG.feeReserveSol, startingBalanceSol * 0.05) };
   return [
-    { ...base, name: "approved-strict", minRealSolReserves: 100 },
-    { ...base, name: "exploratory-20sol", minRealSolReserves: 20 },
+    { ...base, name: "approved-rules", minRealSolReserves: 20 },
+    { ...base, name: "relaxed-rules", minRealSolReserves: 20, entryRules: RELAXED_MOMENTUM_RULES },
+    { ...base, name: "loose-rules", minRealSolReserves: 10, entryRules: LOOSE_MOMENTUM_RULES },
     {
       ...base,
-      name: "exploratory-20sol-2x-costs",
+      name: "relaxed-rules-2x-costs",
       minRealSolReserves: 20,
+      entryRules: RELAXED_MOMENTUM_RULES,
       latencyMs: BASE_CONFIG.latencyMs * 2,
       latencySlippageBps: BASE_CONFIG.latencySlippageBps * 2,
       priorityFeeSol: BASE_CONFIG.priorityFeeSol * 2,
       migrationPenaltyBps: BASE_CONFIG.migrationPenaltyBps * 2,
     },
-    { ...base, name: "exploratory-20sol-no-refund", minRealSolReserves: 20, rentRefundedOnExit: false },
   ];
 }

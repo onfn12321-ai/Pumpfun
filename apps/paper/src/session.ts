@@ -44,6 +44,7 @@ export class PaperSession {
       durationMinutes,
       messages: this.market.messages,
       trackedTokens: this.market.tokens.size,
+      invalidCurveTokens: this.market.invalidCurves,
       traders: this.traders.map((trader) => {
         const metrics = evaluateTrades(trader.closed.map((trade) => ({
           mint: trade.mint,

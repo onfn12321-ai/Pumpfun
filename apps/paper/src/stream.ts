@@ -30,6 +30,8 @@ export interface RawPumpMessage {
   vTokensInBondingCurve?: number;
   vSolInBondingCurve?: number;
   realTokensInBondingCurve?: number;
+  realSolInBondingCurve?: number;
+  isMayhemMode?: boolean;
   pool?: string;
   name?: string;
   symbol?: string;
@@ -94,7 +96,7 @@ export function decodePumpEvent(base64: string, signature?: string, slot?: numbe
       reader.u64(); // on-chain timestamp
       const vSol = reader.u64();
       const vTokens = reader.u64();
-      reader.u64(); // real SOL reserves
+      const realSol = reader.u64();
       const realTokens = reader.u64();
       return {
         ...meta,
@@ -106,6 +108,7 @@ export function decodePumpEvent(base64: string, signature?: string, slot?: numbe
         vSolInBondingCurve: Number(vSol) / LAMPORTS_PER_SOL,
         vTokensInBondingCurve: Number(vTokens) / TOKEN_DECIMALS,
         realTokensInBondingCurve: Number(realTokens) / TOKEN_DECIMALS,
+        realSolInBondingCurve: Number(realSol) / LAMPORTS_PER_SOL,
         pool: "pump",
       };
     }
@@ -120,7 +123,12 @@ export function decodePumpEvent(base64: string, signature?: string, slot?: numbe
       reader.u64(); // timestamp
       const vTokens = reader.u64();
       const vSol = reader.u64();
-      const standard = vSol === STANDARD_INITIAL_VIRTUAL_SOL_LAMPORTS && vTokens === STANDARD_INITIAL_VIRTUAL_TOKENS_RAW;
+      reader.u64(); // real token reserves
+      reader.u64(); // total supply
+      reader.publicKey(); // token program
+      // Mayhem-mode curves are traded by a protocol agent and do not follow the standard curve.
+      const isMayhemMode = reader.bool();
+      const standard = !isMayhemMode && vSol === STANDARD_INITIAL_VIRTUAL_SOL_LAMPORTS && vTokens === STANDARD_INITIAL_VIRTUAL_TOKENS_RAW;
       return {
         ...meta,
         txType: "create",
@@ -131,6 +139,7 @@ export function decodePumpEvent(base64: string, signature?: string, slot?: numbe
         initialBuy: 0,
         vSolInBondingCurve: Number(vSol) / LAMPORTS_PER_SOL,
         vTokensInBondingCurve: Number(vTokens) / TOKEN_DECIMALS,
+        isMayhemMode,
         pool: standard ? "pump" : "nonstandard",
       };
     }
@@ -145,27 +154,43 @@ export function decodePumpEvent(base64: string, signature?: string, slot?: numbe
   return undefined;
 }
 
+export const DEFAULT_RPC_WS_URLS = [DEFAULT_RPC_WS_URL, "wss://solana-rpc.publicnode.com"];
+
 export interface StreamOptions {
-  url?: string;
+  /** Redundant endpoints. Events are de-duplicated, so one live endpoint is enough. */
+  urls?: readonly string[];
   recordPath?: string;
   onMessage: (message: RecordedMessage) => void;
   onStatus?: (status: string) => void;
-  /** Forces a reconnect, and therefore a recorded gap, after this much silence. */
+  /** Forces a reconnect after this much silence on one endpoint. */
   silenceTimeoutMs?: number;
 }
 
+interface Connection {
+  url: string;
+  socket: WebSocket | undefined;
+  open: boolean;
+  lastMessageAt: number;
+  reconnects: number;
+}
+
+const MAX_SEEN_EVENTS = 200_000;
+
 export class PumpLogsStream {
-  private socket: WebSocket | undefined;
+  private readonly connections: Connection[];
   private recorder: WriteStream | undefined;
   private stopped = false;
-  private reconnects = 0;
-  private lastMessageAt = 0;
   private watchdog: NodeJS.Timeout | undefined;
+  /** True after every endpoint was down at the same time. The next open records a gap. */
+  private allDown = false;
+  private readonly seen = new Set<string>();
   /** Trades are kept only for curves whose standard create event was observed. */
   private readonly knownMints = new Set<string>();
-  counts = { creates: 0, trades: 0, completes: 0, failedTransactions: 0, gaps: 0 };
+  counts = { creates: 0, trades: 0, completes: 0, failedTransactions: 0, gaps: 0, duplicates: 0, reconnects: 0 };
 
   constructor(private readonly options: StreamOptions) {
+    const urls = options.urls && options.urls.length > 0 ? options.urls : DEFAULT_RPC_WS_URLS;
+    this.connections = urls.map((url) => ({ url, socket: undefined, open: false, lastMessageAt: 0, reconnects: 0 }));
     if (options.recordPath) {
       mkdirSync(dirname(options.recordPath), { recursive: true });
       this.recorder = createWriteStream(options.recordPath, { flags: "a" });
@@ -174,12 +199,14 @@ export class PumpLogsStream {
 
   start(): void {
     this.stopped = false;
-    this.connect();
+    for (const connection of this.connections) this.connect(connection);
     const silence = this.options.silenceTimeoutMs ?? 30_000;
     this.watchdog = setInterval(() => {
-      if (this.socket?.readyState === WebSocket.OPEN && Date.now() - this.lastMessageAt > silence) {
-        this.options.onStatus?.("no data; forcing reconnect");
-        this.socket.close();
+      for (const connection of this.connections) {
+        if (connection.open && Date.now() - connection.lastMessageAt > silence) {
+          this.options.onStatus?.(`${connection.url}: no data; forcing reconnect`);
+          connection.socket?.close();
+        }
       }
     }, 5_000);
   }
@@ -187,68 +214,91 @@ export class PumpLogsStream {
   stop(): void {
     this.stopped = true;
     if (this.watchdog) clearInterval(this.watchdog);
-    this.socket?.close();
+    for (const connection of this.connections) connection.socket?.close();
     this.recorder?.end();
   }
 
-  private connect(): void {
-    const socket = new WebSocket(this.options.url ?? DEFAULT_RPC_WS_URL);
-    this.socket = socket;
+  openConnections(): number {
+    return this.connections.filter((connection) => connection.open).length;
+  }
+
+  private connect(connection: Connection): void {
+    const socket = new WebSocket(connection.url);
+    connection.socket = socket;
     socket.onopen = () => {
-      this.lastMessageAt = Date.now();
-      this.options.onStatus?.(`connected (reconnects=${this.reconnects})`);
+      connection.open = true;
+      connection.lastMessageAt = Date.now();
+      this.options.onStatus?.(`${connection.url}: connected (reconnects=${connection.reconnects})`);
       socket.send(JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
         method: "logsSubscribe",
         params: [{ mentions: [PUMP_PROGRAM_ID] }, { commitment: "confirmed" }],
       }));
-      // A reconnect creates an observation gap. Record it so consumers fail closed.
-      if (this.reconnects > 0) {
+      // Every endpoint was down, so events were missed. Record a gap so consumers fail closed.
+      if (this.allDown) {
+        this.allDown = false;
         this.counts.gaps += 1;
-        this.emit({ txType: "stream_gap", message: "reconnected" });
+        this.emit({ txType: "stream_gap", message: "all endpoints were disconnected" });
       }
     };
     socket.onmessage = (event) => {
-      this.lastMessageAt = Date.now();
-      let payload: { params?: { result?: { context?: { slot?: number }; value?: { signature?: string; err: unknown; logs?: string[] } } } };
-      try {
-        payload = JSON.parse(String(event.data)) as typeof payload;
-      } catch {
-        return;
-      }
-      const result = payload.params?.result;
-      const value = result?.value;
-      if (!value?.logs) return;
-      if (value.err !== null) {
-        this.counts.failedTransactions += 1;
-        return;
-      }
-      for (const line of value.logs) {
-        if (!line.startsWith("Program data: ")) continue;
-        const decoded = decodePumpEvent(line.slice(14), value.signature, result?.context?.slot);
-        if (!decoded?.mint) continue;
-        if (decoded.txType === "create") {
-          if (decoded.pool !== "pump") continue;
-          this.knownMints.add(decoded.mint);
-          this.counts.creates += 1;
-        } else if (!this.knownMints.has(decoded.mint)) {
-          continue;
-        } else if (decoded.txType === "complete") {
-          this.counts.completes += 1;
-        } else {
-          this.counts.trades += 1;
-        }
-        this.emit(decoded);
-      }
+      connection.lastMessageAt = Date.now();
+      this.handle(String(event.data));
     };
-    socket.onerror = () => this.options.onStatus?.("socket error");
+    socket.onerror = () => this.options.onStatus?.(`${connection.url}: socket error`);
     socket.onclose = () => {
+      const wasOpen = connection.open;
+      connection.open = false;
       if (this.stopped) return;
-      this.reconnects += 1;
-      this.options.onStatus?.("disconnected; reconnecting in 3s");
-      setTimeout(() => this.connect(), 3_000);
+      if (wasOpen && this.openConnections() === 0) this.allDown = true;
+      connection.reconnects += 1;
+      this.counts.reconnects += 1;
+      this.options.onStatus?.(`${connection.url}: disconnected; reconnecting in 3s (open endpoints=${this.openConnections()})`);
+      setTimeout(() => this.connect(connection), 3_000);
     };
+  }
+
+  private handle(raw: string): void {
+    let payload: { params?: { result?: { context?: { slot?: number }; value?: { signature?: string; err: unknown; logs?: string[] } } } };
+    try {
+      payload = JSON.parse(raw) as typeof payload;
+    } catch {
+      return;
+    }
+    const result = payload.params?.result;
+    const value = result?.value;
+    if (!value?.logs || !value.signature) return;
+    if (this.seen.has(value.signature)) {
+      this.counts.duplicates += 1;
+      return;
+    }
+    this.seen.add(value.signature);
+    if (this.seen.size > MAX_SEEN_EVENTS) {
+      const oldest = this.seen.values().next().value;
+      if (oldest !== undefined) this.seen.delete(oldest);
+    }
+    if (value.err !== null) {
+      this.counts.failedTransactions += 1;
+      return;
+    }
+    for (const line of value.logs) {
+      if (!line.startsWith("Program data: ")) continue;
+      const decoded = decodePumpEvent(line.slice(14), value.signature, result?.context?.slot);
+      if (!decoded?.mint) continue;
+      if (decoded.txType === "create") {
+        if (decoded.pool !== "pump") continue;
+        this.knownMints.add(decoded.mint);
+        this.counts.creates += 1;
+      } else if (!this.knownMints.has(decoded.mint)) {
+        continue;
+      } else if (decoded.txType === "complete") {
+        this.counts.completes += 1;
+      } else {
+        this.counts.trades += 1;
+      }
+      this.emit(decoded);
+    }
   }
 
   private emit(data: RawPumpMessage): void {

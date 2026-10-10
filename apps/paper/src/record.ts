@@ -5,7 +5,7 @@ const recordPath = process.env.RECORD_PATH ?? `data/recordings/pump-${new Date()
 const durationMs = Number(process.env.DURATION_MINUTES ?? "0") * 60_000;
 
 const stream = new PumpLogsStream({
-  ...(process.env.SOLANA_WS_URL ? { url: process.env.SOLANA_WS_URL } : {}),
+  ...(process.env.SOLANA_WS_URLS ? { urls: process.env.SOLANA_WS_URLS.split(",").map((url) => url.trim()).filter(Boolean) } : {}),
   recordPath,
   onMessage: () => undefined,
   onStatus: (status) => console.log(`[${new Date().toISOString()}] ${status}`),

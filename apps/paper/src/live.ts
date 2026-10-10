@@ -15,7 +15,7 @@ const rpcUrl = process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.co
 const session = new PaperSession(defaultVariants(Number(process.env.STARTING_BALANCE_SOL ?? "0.5")));
 const authority = new AuthorityChecker(rpcUrl, "data/cache/mint-authorities.json");
 const stream = new PumpLogsStream({
-  ...(process.env.SOLANA_WS_URL ? { url: process.env.SOLANA_WS_URL } : {}),
+  ...(process.env.SOLANA_WS_URLS ? { urls: process.env.SOLANA_WS_URLS.split(",").map((url) => url.trim()).filter(Boolean) } : {}),
   recordPath: `${outputDir}/market.ndjson`,
   onMessage: (message) => session.ingest(message),
   onStatus: (status) => console.log(`[${new Date().toISOString()}] stream ${status}`),

@@ -102,22 +102,47 @@ export function calculateMomentumFeatures(input: MomentumInput): MomentumFeature
   };
 }
 
-export function evaluateMomentumEntry(input: MomentumInput): EntryDecision {
+/** Entry thresholds. Live trading uses only APPROVED_MOMENTUM_RULES. */
+export interface MomentumRules {
+  minimumTokenAgeMs: number;
+  minReturn60sBps: number;
+  maxReturn60sBps: number;
+  minReturn5mBps: number;
+  maxReturn5mBps: number;
+  minVolumeRatio: number;
+  minDistinctBuyers5m: number;
+  minBuyVolumeShareBps: number;
+  maxFiveSecondReturnBps: number;
+}
+
+export const APPROVED_MOMENTUM_RULES: Readonly<MomentumRules> = Object.freeze({
+  minimumTokenAgeMs: MINIMUM_TOKEN_AGE_MS,
+  minReturn60sBps: 300,
+  maxReturn60sBps: 1_500,
+  minReturn5mBps: 800,
+  maxReturn5mBps: 4_000,
+  minVolumeRatio: 2,
+  minDistinctBuyers5m: 20,
+  minBuyVolumeShareBps: 6_000,
+  maxFiveSecondReturnBps: 1_500,
+});
+
+export function evaluateMomentumEntry(input: MomentumInput, rules: Readonly<MomentumRules> = APPROVED_MOMENTUM_RULES): EntryDecision {
   const reasons: EntryReason[] = [];
-  if (input.decisionAt.getTime() - input.tokenCreatedAt.getTime() < MINIMUM_TOKEN_AGE_MS) reasons.push("TOKEN_TOO_NEW");
+  if (input.decisionAt.getTime() - input.tokenCreatedAt.getTime() < rules.minimumTokenAgeMs) reasons.push("TOKEN_TOO_NEW");
   const features = calculateMomentumFeatures(input);
   if (!features) {
     reasons.push("INCOMPLETE_MARKET_HISTORY");
     return { action: "no_trade", reasons };
   }
-  if (features.return60sBps < 300 || features.return60sBps > 1_500) reasons.push("RETURN_60S_OUT_OF_RANGE");
-  if (features.return5mBps < 800 || features.return5mBps > 4_000) reasons.push("RETURN_5M_OUT_OF_RANGE");
-  if (features.lastMinuteVolumeLamports < features.precedingFourMinuteMeanVolumeLamports * 2) {
+  if (features.return60sBps < rules.minReturn60sBps || features.return60sBps > rules.maxReturn60sBps) reasons.push("RETURN_60S_OUT_OF_RANGE");
+  if (features.return5mBps < rules.minReturn5mBps || features.return5mBps > rules.maxReturn5mBps) reasons.push("RETURN_5M_OUT_OF_RANGE");
+  if (features.lastMinuteVolumeLamports < features.precedingFourMinuteMeanVolumeLamports * rules.minVolumeRatio) {
     reasons.push("VOLUME_ACCELERATION_TOO_LOW");
   }
-  if (features.distinctBuyers5m < 20) reasons.push("INSUFFICIENT_DISTINCT_BUYERS");
-  if (features.buyVolumeShareBps < 6_000) reasons.push("BUY_VOLUME_SHARE_TOO_LOW");
-  if (features.largestFiveSecondReturnBps > 1_500) reasons.push("SINGLE_BUCKET_PUMP");
+  if (features.distinctBuyers5m < rules.minDistinctBuyers5m) reasons.push("INSUFFICIENT_DISTINCT_BUYERS");
+  if (features.buyVolumeShareBps < rules.minBuyVolumeShareBps) reasons.push("BUY_VOLUME_SHARE_TOO_LOW");
+  if (features.largestFiveSecondReturnBps > rules.maxFiveSecondReturnBps) reasons.push("SINGLE_BUCKET_PUMP");
   return { action: reasons.length === 0 ? "enter" : "no_trade", reasons, features };
 }
 

@@ -5,6 +5,9 @@ export const TOTAL_SUPPLY_TOKENS = 1_000_000_000;
 export const INITIAL_VIRTUAL_SOL = 30;
 export const INITIAL_VIRTUAL_TOKENS = 1_073_000_000;
 export const BUCKET_MS = 5_000;
+/** Standard Pump.fun curves keep virtual SOL x virtual tokens constant. */
+export const STANDARD_CURVE_K = INITIAL_VIRTUAL_SOL * INITIAL_VIRTUAL_TOKENS;
+export const CURVE_INVARIANT_TOLERANCE = 1e-4;
 export const HISTORY_BUCKETS = 60;
 
 export interface CurveTrade {
@@ -29,6 +32,8 @@ export interface TokenState {
   creatorBought: number;
   creatorSold: number;
   migrated: boolean;
+  /** Set when a trade breaks the standard curve invariant. The token is never entered again. */
+  invalidCurve: boolean;
   lastEventAt: number;
 }
 
@@ -41,6 +46,7 @@ export class MarketState {
   readonly tokens = new Map<string, TokenState>();
   lastGapAt = Number.NEGATIVE_INFINITY;
   messages = 0;
+  invalidCurves = 0;
 
   apply(observedAt: number, data: RawPumpMessage): TokenState | undefined {
     this.messages += 1;
@@ -67,6 +73,7 @@ export class MarketState {
         creatorBought: initialBuy,
         creatorSold: 0,
         migrated: false,
+        invalidCurve: false,
         lastEventAt: observedAt,
       };
       if (initialBuy > 0) {
@@ -91,6 +98,14 @@ export class MarketState {
     const sol = Number(data.solAmount);
     const tokens = Number(data.tokenAmount);
     if (!(vSol > 0) || !(vTokens > 0) || !(sol > 0) || !(tokens > 0)) return undefined;
+    if (Math.abs((vSol * vTokens) / STANDARD_CURVE_K - 1) > CURVE_INVARIANT_TOLERANCE) {
+      // Prices from this curve cannot be trusted. Keep the last valid reserves and block the token.
+      if (!token.invalidCurve) this.invalidCurves += 1;
+      token.invalidCurve = true;
+      token.migrated = true;
+      token.lastEventAt = observedAt;
+      return token;
+    }
     const trader = String(data.traderPublicKey ?? "");
     token.vSol = vSol;
     token.vTokens = vTokens;
