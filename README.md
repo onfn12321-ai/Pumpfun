@@ -48,6 +48,29 @@ npm run start:paper
 
 The control service binds to `127.0.0.1` by default. Never expose the browser debugging port or the control service publicly.
 
+## Live paper trading and backtests
+
+These commands use only public, read-only data. They have no wallet, no key, and no order path.
+
+```bash
+# Live paper trading. Writes data/paper/<RUN_ID>/{summary.json,trades.csv,market.ndjson}.
+RUN_ID=my-run DURATION_MINUTES=240 npm run paper:live
+
+# Replay a recording through the same engine.
+OUTPUT_DIR=data/backtest/my-run npm run paper:backtest -- data/paper/my-run/market.ndjson
+```
+
+- The market feed is Pump.fun program logs from Solana `logsSubscribe`. The default is the public mainnet endpoint. Set `SOLANA_WS_URL` and `SOLANA_RPC_URL` for a dedicated RPC.
+- The feed sees only tokens created after it starts. A token can trade 10 minutes after the feed sees its creation.
+- Holder shares come from observed curve trades only. Wallet-to-wallet transfers are not seen.
+- Mint and freeze authority checks use `getAccountInfo`. A failed check blocks the entry.
+- Fills use the reserves visible after the modeled latency, the 1.25% trading fee, extra latency slippage, network and priority fees, and the slippage limit. A fill outside the slippage limit fails and costs the network fee.
+- Three portfolios run side by side, each with 10 paper SOL and the aggressive limits (5% per position, 10% daily loss, 40% exposure):
+  - `approved-strict` uses the approved 100 SOL reserve filter. A Pump.fun curve graduates near 85 real SOL, so this portfolio cannot enter on the bonding curve.
+  - `exploratory-20sol` lowers the reserve filter to 20 real SOL. This change is not approved for live use.
+  - `exploratory-20sol-2x-costs` doubles latency, latency slippage, priority fee, and the migration penalty.
+- A few hours of results do not satisfy the release gates and do not predict future results.
+
 ## Architecture
 
 - `apps/collector` normalizes permitted observations and decoded on-chain events.

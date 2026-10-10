@@ -12,6 +12,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "start:paper": "tsx apps/paper/src/main.ts",
+    "paper:live": "tsx apps/paper/src/live.ts",
+    "paper:record": "tsx apps/paper/src/record.ts",
+    "paper:backtest": "tsx apps/paper/src/backtest.ts",
     "start:replay": "tsx apps/replay/src/main.ts",
     "start:executor": "tsx apps/executor/src/main.ts",
     "start:control": "tsx apps/control/src/main.ts"
