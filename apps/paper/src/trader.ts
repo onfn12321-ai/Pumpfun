@@ -11,6 +11,7 @@ import {
   rankMomentumCandidates,
 } from "../../../packages/strategy/src/index.js";
 import { EARLY_ENTRY_RULES, type EarlyEntryRules, evaluateEarlyEntry } from "./early.js";
+import { evaluateMidCurveEntry, MID_CURVE_RULES, type MidCurveRules } from "./midcurve.js";
 import {
   completedBuckets,
   holderProfile,
@@ -50,9 +51,10 @@ export interface PaperTraderConfig {
   rentRefundedOnExit: boolean;
   /** Entry thresholds. Anything other than the approved rules is paper-only. */
   entryRules: Readonly<MomentumRules>;
-  /** "momentum" is the approved strategy. "early" is paper-only. */
-  strategy: "momentum" | "early";
+  /** "momentum" is the approved strategy. "early" and "midcurve" are paper-only. */
+  strategy: "momentum" | "early" | "midcurve";
   earlyRules: Readonly<EarlyEntryRules>;
+  midCurveRules: Readonly<MidCurveRules>;
   exitRules: Readonly<ExitRules>;
   /** Gross profit target that every estimated cost plus margin must fit under. */
   grossTargetBps: number;
@@ -82,6 +84,7 @@ export const BASE_CONFIG: Omit<PaperTraderConfig, "name" | "minRealSolReserves">
   entryRules: APPROVED_MOMENTUM_RULES,
   strategy: "momentum",
   earlyRules: EARLY_ENTRY_RULES,
+  midCurveRules: MID_CURVE_RULES,
   exitRules: APPROVED_EXIT_RULES,
   grossTargetBps: 1_500,
 };
@@ -339,7 +342,7 @@ export class PaperTrader {
     for (const token of this.market.tokens.values()) {
       if (token.migrated || this.isActive(token.mint)) continue;
       if ((this.cooldownUntil.get(token.mint) ?? 0) > now) continue;
-      const signal = this.config.strategy === "early" ? this.earlySignal(token, now) : this.momentumSignal(token, now);
+      const signal = this.signal(token, now);
       if (!signal) continue;
       const rejection = this.safetyRejection(token);
       if (rejection) {
@@ -359,7 +362,7 @@ export class PaperTrader {
       candidates.push({ mint: token.mint, token, ...signal });
     }
 
-    const ranked = this.config.strategy === "early"
+    const ranked = this.config.strategy !== "momentum"
       ? candidates.slice().sort((left, right) => right.score - left.score || left.mint.localeCompare(right.mint))
       : rankMomentumCandidates(candidates.flatMap((candidate) => (candidate.decision ? [{ ...candidate, decision: candidate.decision }] : [])));
     for (const candidate of ranked) {
@@ -443,6 +446,21 @@ export class PaperTrader {
       return undefined;
     }
     return { decision, score: decision.features?.volumeRatio ?? 0 };
+  }
+
+  private signal(token: TokenState, now: number): { decision?: EntryDecision; score: number } | undefined {
+    if (this.config.strategy === "early") return this.earlySignal(token, now);
+    if (this.config.strategy === "midcurve") return this.midCurveSignal(token, now);
+    return this.momentumSignal(token, now);
+  }
+
+  private midCurveSignal(token: TokenState, now: number): { score: number } | undefined {
+    const decision = evaluateMidCurveEntry(token, now, this.config.midCurveRules);
+    if (decision.action !== "enter") {
+      for (const reason of decision.reasons) this.count(reason);
+      return undefined;
+    }
+    return { score: decision.score };
   }
 
   private earlySignal(token: TokenState, now: number): { score: number } | undefined {
@@ -536,6 +554,15 @@ export const EARLY_EXIT_RULES: Readonly<ExitRules> = Object.freeze({
   maxHoldMs: 5 * 60_000,
 });
 
+/** Wide exits for the mid-curve strategy: +50% target, -20% stop, no trailing stop, 10 minute maximum hold. */
+export const MID_CURVE_EXIT_RULES: Readonly<ExitRules> = Object.freeze({
+  takeProfitBps: 5_000,
+  stopLossBps: 2_000,
+  trailingActivationBps: 1_000_000,
+  trailingDrawdownBps: 1_000_000,
+  maxHoldMs: 10 * 60_000,
+});
+
 export function defaultVariants(startingBalanceSol = BASE_CONFIG.startingBalanceSol): PaperTraderConfig[] {
   const base = { ...BASE_CONFIG, startingBalanceSol, feeReserveSol: Math.min(BASE_CONFIG.feeReserveSol, startingBalanceSol * 0.05) };
   const early: Omit<PaperTraderConfig, "name"> = {
@@ -551,7 +578,29 @@ export function defaultVariants(startingBalanceSol = BASE_CONFIG.startingBalance
     exitRules: EARLY_EXIT_RULES,
     grossTargetBps: 2_500,
   };
+  const midCurve: Omit<PaperTraderConfig, "name"> = {
+    ...base,
+    strategy: "midcurve",
+    minRealSolReserves: MID_CURVE_RULES.minRealSol,
+    // The analysis applied no holder filter. These limits only remove extreme concentration.
+    maxHolderPct: 10,
+    maxTop10Pct: 40,
+    maxCreatorPct: 10,
+    slippageBps: 200,
+    cooldownMs: 5 * 60_000,
+    exitRules: MID_CURVE_EXIT_RULES,
+    grossTargetBps: 5_000,
+  };
   return [
+    { ...midCurve, name: "mid-curve" },
+    {
+      ...midCurve,
+      name: "mid-curve-2x-costs",
+      latencyMs: BASE_CONFIG.latencyMs * 2,
+      latencySlippageBps: BASE_CONFIG.latencySlippageBps * 2,
+      priorityFeeSol: BASE_CONFIG.priorityFeeSol * 2,
+      migrationPenaltyBps: BASE_CONFIG.migrationPenaltyBps * 2,
+    },
     { ...base, name: "approved-rules", minRealSolReserves: 20 },
     { ...base, name: "relaxed-rules", minRealSolReserves: 20, entryRules: RELAXED_MOMENTUM_RULES },
     { ...base, name: "loose-rules", minRealSolReserves: 10, entryRules: LOOSE_MOMENTUM_RULES },
