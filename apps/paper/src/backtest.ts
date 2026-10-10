@@ -18,7 +18,7 @@ if (files.length === 0) {
 }
 const outputDir = process.env.OUTPUT_DIR ?? "data/backtest/latest";
 const rpcUrl = process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com";
-const session = new PaperSession(defaultVariants());
+const session = new PaperSession(defaultVariants(Number(process.env.STARTING_BALANCE_SOL ?? "0.5")));
 const authority = new AuthorityChecker(rpcUrl, "data/cache/mint-authorities.json");
 
 let nextTick: number | undefined;

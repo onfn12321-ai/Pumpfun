@@ -65,10 +65,12 @@ OUTPUT_DIR=data/backtest/my-run npm run paper:backtest -- data/paper/my-run/mark
 - Holder shares come from observed curve trades only. Wallet-to-wallet transfers are not seen.
 - Mint and freeze authority checks use `getAccountInfo`. A failed check blocks the entry.
 - Fills use the reserves visible after the modeled latency, the 1.25% trading fee, extra latency slippage, network and priority fees, and the slippage limit. A fill outside the slippage limit fails and costs the network fee.
-- Three portfolios run side by side, each with 10 paper SOL and the aggressive limits (5% per position, 10% daily loss, 40% exposure):
+- Four portfolios run side by side. Each starts with `STARTING_BALANCE_SOL` paper SOL (default 0.5) and uses the aggressive limits (5% per position, 10% daily loss, 40% exposure). At 0.5 SOL, one position is 0.025 SOL.
+- Each first buy of a token pays a token-account deposit of about 0.00207 SOL. The deposit comes back only if the sell closes the account.
   - `approved-strict` uses the approved 100 SOL reserve filter. A Pump.fun curve graduates near 85 real SOL, so this portfolio cannot enter on the bonding curve.
   - `exploratory-20sol` lowers the reserve filter to 20 real SOL. This change is not approved for live use.
   - `exploratory-20sol-2x-costs` doubles latency, latency slippage, priority fee, and the migration penalty.
+  - `exploratory-20sol-no-refund` assumes the deposit does not come back. At 0.025 SOL per position, the deposit is about 8% of the trade, so the cost hurdle blocks every entry.
 - A few hours of results do not satisfy the release gates and do not predict future results.
 
 ## Architecture

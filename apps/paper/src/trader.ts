@@ -34,6 +34,10 @@ export interface PaperTraderConfig {
   cooldownMs: number;
   gapCooldownMs: number;
   migrationPenaltyBps: number;
+  /** Rent deposit for the token account that a first buy creates. */
+  tokenAccountRentSol: number;
+  /** True when the sell closes the token account and returns the deposit. */
+  rentRefundedOnExit: boolean;
 }
 
 export const BASE_CONFIG: Omit<PaperTraderConfig, "name" | "minRealSolReserves"> = {
@@ -55,6 +59,8 @@ export const BASE_CONFIG: Omit<PaperTraderConfig, "name" | "minRealSolReserves">
   cooldownMs: 30 * 60_000,
   gapCooldownMs: 5 * 60_000,
   migrationPenaltyBps: 300,
+  tokenAccountRentSol: 0.00207,
+  rentRefundedOnExit: true,
 };
 
 interface PendingOrder {
@@ -143,7 +149,7 @@ export class PaperTrader {
     this.rejectionCounts[reason] = (this.rejectionCounts[reason] ?? 0) + 1;
   }
 
-  /** Net SOL from selling the whole position now, after fees and latency slippage. */
+  /** Net SOL from selling the whole position now, after fees and latency slippage. Excludes a refundable deposit. */
   liquidationValue(position: OpenPosition, token: TokenState | undefined): number {
     if (!token) return 0;
     const { solOut } = quoteSell(token.vSol, token.vTokens, position.tokens, this.config.tradeFeeBps);
@@ -151,10 +157,14 @@ export class PaperTrader {
     return Math.max(0, solOut * (1 - (this.config.latencySlippageBps + penalty) / 10_000) - this.txFee());
   }
 
+  private rentRefund(): number {
+    return this.config.rentRefundedOnExit ? this.config.tokenAccountRentSol : 0;
+  }
+
   equity(): number {
     let value = this.cashSol;
     for (const position of this.positions.values()) {
-      value += this.liquidationValue(position, this.market.tokens.get(position.mint));
+      value += this.liquidationValue(position, this.market.tokens.get(position.mint)) + this.rentRefund();
     }
     return value;
   }
@@ -198,12 +208,13 @@ export class PaperTrader {
         return;
       }
       this.feesPaidSol += order.sizeSol * (this.config.tradeFeeBps / 10_000);
+      this.cashSol -= this.config.tokenAccountRentSol;
       this.positions.set(order.mint, {
         mint: order.mint,
         symbol: token.symbol,
         openedAt: order.fillAt,
         tokens: tokensOut,
-        entryCostSol: order.sizeSol + fee,
+        entryCostSol: order.sizeSol + fee + (this.config.rentRefundedOnExit ? 0 : this.config.tokenAccountRentSol),
         entryPrice: order.sizeSol / tokensOut,
         peakValueSol: 0,
         exiting: false,
@@ -224,7 +235,7 @@ export class PaperTrader {
       return;
     }
     this.feesPaidSol += (solOut / (1 - this.config.tradeFeeBps / 10_000)) * (this.config.tradeFeeBps / 10_000);
-    this.cashSol += proceeds;
+    this.cashSol += proceeds + this.rentRefund();
     this.positions.delete(order.mint);
     this.cooldownUntil.set(order.mint, order.fillAt + this.config.cooldownMs);
     const exitNet = proceeds - fee;
@@ -349,14 +360,15 @@ export class PaperTrader {
         this.count("QUOTE_PRICE_IMPACT_TOO_HIGH");
         continue;
       }
-      const txFeeBps = Math.ceil((this.txFee() / sizeSol) * 10_000);
+      const lostRentSol = this.config.rentRefundedOnExit ? 0 : this.config.tokenAccountRentSol;
+      const txFeeBps = Math.ceil(((this.txFee() * 2 + lostRentSol) / sizeSol) * 10_000);
       const hurdle = meetsCostHurdle({
         entryFeeBps: this.config.tradeFeeBps,
         exitFeeBps: this.config.tradeFeeBps,
         entryImpactBps: buy.impactBps,
         exitImpactBps: sell.impactBps,
         slippageAllowanceBps: this.config.slippageBps,
-        priorityFeeBps: txFeeBps * 2,
+        priorityFeeBps: txFeeBps,
         latencyCostBps: this.config.latencySlippageBps * 2,
       });
       if (!hurdle.allowed) {
@@ -386,7 +398,7 @@ export class PaperTrader {
         },
         {
           principalLamports: toLamports(sizeSol) - 1n,
-          worstCaseFeesLamports: toLamports(this.txFee() * 2),
+          worstCaseFeesLamports: toLamports(this.txFee() * 2 + this.config.tokenAccountRentSol),
           worstCaseSlippageLamports: toLamports((sizeSol * this.config.slippageBps) / 10_000),
         },
       );
@@ -444,12 +456,13 @@ function round(value: number): number {
   return Math.round(value * 1e6) / 1e6;
 }
 
-export function defaultVariants(): PaperTraderConfig[] {
+export function defaultVariants(startingBalanceSol = BASE_CONFIG.startingBalanceSol): PaperTraderConfig[] {
+  const base = { ...BASE_CONFIG, startingBalanceSol, feeReserveSol: Math.min(BASE_CONFIG.feeReserveSol, startingBalanceSol * 0.05) };
   return [
-    { ...BASE_CONFIG, name: "approved-strict", minRealSolReserves: 100 },
-    { ...BASE_CONFIG, name: "exploratory-20sol", minRealSolReserves: 20 },
+    { ...base, name: "approved-strict", minRealSolReserves: 100 },
+    { ...base, name: "exploratory-20sol", minRealSolReserves: 20 },
     {
-      ...BASE_CONFIG,
+      ...base,
       name: "exploratory-20sol-2x-costs",
       minRealSolReserves: 20,
       latencyMs: BASE_CONFIG.latencyMs * 2,
@@ -457,5 +470,6 @@ export function defaultVariants(): PaperTraderConfig[] {
       priorityFeeSol: BASE_CONFIG.priorityFeeSol * 2,
       migrationPenaltyBps: BASE_CONFIG.migrationPenaltyBps * 2,
     },
+    { ...base, name: "exploratory-20sol-no-refund", minRealSolReserves: 20, rentRefundedOnExit: false },
   ];
 }

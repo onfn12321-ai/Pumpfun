@@ -12,7 +12,7 @@ const outputDir = process.env.OUTPUT_DIR ?? `data/paper/${runId}`;
 const durationMs = Number(process.env.DURATION_MINUTES ?? "0") * 60_000;
 const rpcUrl = process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com";
 
-const session = new PaperSession(defaultVariants());
+const session = new PaperSession(defaultVariants(Number(process.env.STARTING_BALANCE_SOL ?? "0.5")));
 const authority = new AuthorityChecker(rpcUrl, "data/cache/mint-authorities.json");
 const stream = new PumpLogsStream({
   ...(process.env.SOLANA_WS_URL ? { url: process.env.SOLANA_WS_URL } : {}),

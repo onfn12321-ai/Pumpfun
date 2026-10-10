@@ -135,3 +135,35 @@ describe("pump event decoder", () => {
     expect(decodePumpEvent(Buffer.from("bddb7fd34ee661ee00", "hex").toString("base64"))).toBeUndefined();
   });
 });
+
+describe("small paper wallet", () => {
+  it("sizes a 0.5 SOL wallet at 0.025 SOL and returns a refundable account deposit", () => {
+    const { market, buy } = qualifyingMarket();
+    const trader = new PaperTrader({ ...BASE_CONFIG, name: "small", startingBalanceSol: 0.5, feeReserveSol: 0.025, minRealSolReserves: 20 }, market);
+    trader.tick(DECISION, new Map([[MINT, "ok"]]));
+    trader.advanceTo(DECISION + BASE_CONFIG.latencyMs);
+    const position = [...trader.positions.values()][0]!;
+    expect(position.entryCostSol).toBeCloseTo(0.025 + 0.000205, 6);
+    expect(trader.cashSol).toBeCloseTo(0.5 - 0.025 - 0.000205 - BASE_CONFIG.tokenAccountRentSol, 6);
+    buy(DECISION + 2_000, "whale", 8);
+    trader.tick(DECISION + 5_000, new Map([[MINT, "ok"]]));
+    trader.advanceTo(DECISION + 5_000 + BASE_CONFIG.latencyMs);
+    expect(trader.closed).toHaveLength(1);
+    expect(trader.cashSol).toBeCloseTo(0.5 + trader.closed[0]!.pnlSol, 9);
+  });
+
+  it("refuses a 0.025 SOL trade when the account deposit is not refunded", () => {
+    const { market } = qualifyingMarket();
+    const small = { ...BASE_CONFIG, startingBalanceSol: 0.5, feeReserveSol: 0.025, minRealSolReserves: 20 };
+    const trader = new PaperTrader({ ...small, name: "no-refund", rentRefundedOnExit: false }, market);
+    trader.tick(DECISION, new Map([[MINT, "ok"]]));
+    expect(trader.rejectionCounts.COST_HURDLE_NOT_MET).toBe(1);
+    expect(trader.rejectionCounts.ENTRY_SUBMITTED).toBeUndefined();
+
+    // The same lost deposit is affordable on a 10 SOL wallet, where it is a cost in the entry basis.
+    const large = new PaperTrader({ ...BASE_CONFIG, name: "large-no-refund", minRealSolReserves: 20, rentRefundedOnExit: false }, market);
+    large.tick(DECISION, new Map([[MINT, "ok"]]));
+    large.advanceTo(DECISION + BASE_CONFIG.latencyMs);
+    expect([...large.positions.values()][0]!.entryCostSol).toBeCloseTo(0.5 + 0.000205 + BASE_CONFIG.tokenAccountRentSol, 6);
+  });
+});
