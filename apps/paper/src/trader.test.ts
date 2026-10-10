@@ -183,3 +183,15 @@ describe("small paper wallet", () => {
     expect([...large.positions.values()][0]!.entryCostSol).toBeCloseTo(0.5 + 0.000205 + BASE_CONFIG.tokenAccountRentSol, 6);
   });
 });
+
+describe("rpc endpoints", () => {
+  it("adds a provider URL to the public feeds and redacts its key", async () => {
+    const { redactUrl, resolveEndpoints } = await import("./endpoints.js");
+    const resolved = resolveEndpoints({ SOLANA_RPC_PROVIDER_KEY: "https://mainnet.helius-rpc.com/?api-key=secret" });
+    expect(resolved.wsUrls[0]).toBe("wss://mainnet.helius-rpc.com/?api-key=secret");
+    expect(resolved.wsUrls).toHaveLength(3);
+    expect(resolved.httpUrl).toBe("https://mainnet.helius-rpc.com/?api-key=secret");
+    expect(redactUrl(resolved.wsUrls[0]!)).toBe("wss://mainnet.helius-rpc.com/<redacted>");
+    expect(redactUrl("wss://solana-rpc.publicnode.com")).toBe("wss://solana-rpc.publicnode.com");
+  });
+});

@@ -1,5 +1,9 @@
 import { AuthorityChecker } from "./authority.js";
+import { redactUrl, resolveEndpoints } from "./endpoints.js";
 import { PumpLogsStream } from "./stream.js";
+
+const endpoints = resolveEndpoints();
+console.log(`feed endpoints: ${endpoints.wsUrls.map(redactUrl).join(", ")}`);
 import { PaperSession } from "./session.js";
 import { defaultVariants } from "./trader.js";
 
@@ -10,12 +14,11 @@ import { defaultVariants } from "./trader.js";
 const runId = process.env.RUN_ID ?? new Date().toISOString().replace(/[:.]/g, "-");
 const outputDir = process.env.OUTPUT_DIR ?? `data/paper/${runId}`;
 const durationMs = Number(process.env.DURATION_MINUTES ?? "0") * 60_000;
-const rpcUrl = process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com";
 
 const session = new PaperSession(defaultVariants(Number(process.env.STARTING_BALANCE_SOL ?? "0.5")));
-const authority = new AuthorityChecker(rpcUrl, "data/cache/mint-authorities.json");
+const authority = new AuthorityChecker(endpoints.httpUrl, "data/cache/mint-authorities.json");
 const stream = new PumpLogsStream({
-  ...(process.env.SOLANA_WS_URLS ? { urls: process.env.SOLANA_WS_URLS.split(",").map((url) => url.trim()).filter(Boolean) } : {}),
+  urls: endpoints.wsUrls,
   recordPath: `${outputDir}/market.ndjson`,
   onMessage: (message) => session.ingest(message),
   onStatus: (status) => console.log(`[${new Date().toISOString()}] stream ${status}`),

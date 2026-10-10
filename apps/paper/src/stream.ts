@@ -4,6 +4,8 @@ import { dirname } from "node:path";
 
 import { PublicKey } from "@solana/web3.js";
 
+import { redactUrl } from "./endpoints.js";
+
 /**
  * Read-only Pump.fun market data decoded from public Solana program logs. It
  * needs no API key, never scrapes pump.fun pages, and never signs anything.
@@ -204,7 +206,7 @@ export class PumpLogsStream {
     this.watchdog = setInterval(() => {
       for (const connection of this.connections) {
         if (connection.open && Date.now() - connection.lastMessageAt > silence) {
-          this.options.onStatus?.(`${connection.url}: no data; forcing reconnect`);
+          this.options.onStatus?.(`${redactUrl(connection.url)}: no data; forcing reconnect`);
           connection.socket?.close();
         }
       }
@@ -228,7 +230,7 @@ export class PumpLogsStream {
     socket.onopen = () => {
       connection.open = true;
       connection.lastMessageAt = Date.now();
-      this.options.onStatus?.(`${connection.url}: connected (reconnects=${connection.reconnects})`);
+      this.options.onStatus?.(`${redactUrl(connection.url)}: connected (reconnects=${connection.reconnects})`);
       socket.send(JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
@@ -246,7 +248,7 @@ export class PumpLogsStream {
       connection.lastMessageAt = Date.now();
       this.handle(String(event.data));
     };
-    socket.onerror = () => this.options.onStatus?.(`${connection.url}: socket error`);
+    socket.onerror = () => this.options.onStatus?.(`${redactUrl(connection.url)}: socket error`);
     socket.onclose = () => {
       const wasOpen = connection.open;
       connection.open = false;
@@ -254,7 +256,7 @@ export class PumpLogsStream {
       if (wasOpen && this.openConnections() === 0) this.allDown = true;
       connection.reconnects += 1;
       this.counts.reconnects += 1;
-      this.options.onStatus?.(`${connection.url}: disconnected; reconnecting in 3s (open endpoints=${this.openConnections()})`);
+      this.options.onStatus?.(`${redactUrl(connection.url)}: disconnected; reconnecting in 3s (open endpoints=${this.openConnections()})`);
       setTimeout(() => this.connect(connection), 3_000);
     };
   }

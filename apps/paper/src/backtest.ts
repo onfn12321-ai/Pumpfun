@@ -2,6 +2,7 @@ import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 
 import { AuthorityChecker } from "./authority.js";
+import { resolveEndpoints } from "./endpoints.js";
 import type { RecordedMessage } from "./stream.js";
 import { PaperSession } from "./session.js";
 import { defaultVariants } from "./trader.js";
@@ -17,7 +18,7 @@ if (files.length === 0) {
   process.exit(2);
 }
 const outputDir = process.env.OUTPUT_DIR ?? "data/backtest/latest";
-const rpcUrl = process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com";
+const rpcUrl = resolveEndpoints().httpUrl;
 const session = new PaperSession(defaultVariants(Number(process.env.STARTING_BALANCE_SOL ?? "0.5")));
 const authority = new AuthorityChecker(rpcUrl, "data/cache/mint-authorities.json");
 

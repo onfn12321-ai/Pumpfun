@@ -60,7 +60,7 @@ RUN_ID=my-run DURATION_MINUTES=240 npm run paper:live
 OUTPUT_DIR=data/backtest/my-run npm run paper:backtest -- data/paper/my-run/market.ndjson
 ```
 
-- The market feed is Pump.fun program logs from Solana `logsSubscribe`. By default it connects to two free endpoints at the same time (Solana public and PublicNode) and removes duplicate events. A gap is recorded only when both connections are down. Set `SOLANA_WS_URLS` (comma-separated) and `SOLANA_RPC_URL` to use a dedicated RPC.
+- The market feed is Pump.fun program logs from Solana `logsSubscribe`. By default it connects to two free endpoints at the same time (Solana public and PublicNode) and removes duplicate events. A gap is recorded only when both connections are down. If `SOLANA_RPC_PROVIDER_KEY` holds a provider URL (for example Helius), it is added as a third feed connection and used for mint checks. Logs redact the key. `SOLANA_WS_URLS` (comma-separated) and `SOLANA_RPC_URL` override these defaults.
 - The feed sees only tokens created after it starts.
 - Mayhem-mode tokens are excluded. Any token whose trade breaks the standard curve formula (virtual SOL x virtual tokens = 30 x 1,073,000,000) is blocked, because its prices cannot be trusted.
 - Holder shares come from observed curve trades only. Wallet-to-wallet transfers are not seen.
