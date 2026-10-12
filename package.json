@@ -1,0 +1,37 @@
+{
+  "name": "pumpfun-browser-trading-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start:paper": "tsx apps/paper/src/main.ts",
+    "paper:live": "tsx apps/paper/src/live.ts",
+    "paper:record": "tsx apps/paper/src/record.ts",
+    "paper:backtest": "tsx apps/paper/src/backtest.ts",
+    "start:replay": "tsx apps/replay/src/main.ts",
+    "start:executor": "tsx apps/executor/src/main.ts",
+    "start:control": "tsx apps/control/src/main.ts"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.98.4",
+    "express": "^5.1.0",
+    "pg": "^8.16.3",
+    "playwright": "^1.55.0",
+    "zod": "^4.1.11"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.7.2",
+    "@types/pg": "^8.15.5",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

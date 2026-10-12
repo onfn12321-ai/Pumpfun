@@ -1,0 +1,626 @@
+import { meetsCostHurdle } from "../../../packages/market/src/index.js";
+import { assessEntryRisk } from "../../../packages/risk/src/index.js";
+import {
+  APPROVED_EXIT_RULES,
+  APPROVED_MOMENTUM_RULES,
+  type EntryDecision,
+  evaluateExit,
+  evaluateMomentumEntry,
+  type ExitRules,
+  type MomentumRules,
+  rankMomentumCandidates,
+} from "../../../packages/strategy/src/index.js";
+import { EARLY_ENTRY_RULES, type EarlyEntryRules, evaluateEarlyEntry } from "./early.js";
+import { evaluateMidCurveEntry, MID_CURVE_RULES, type MidCurveRules } from "./midcurve.js";
+import {
+  completedBuckets,
+  holderProfile,
+  INITIAL_VIRTUAL_SOL,
+  type MarketState,
+  quoteBuy,
+  quoteSell,
+  type TokenState,
+} from "./market.js";
+
+export type AuthorityStatus = "ok" | "reject";
+
+export interface PaperTraderConfig {
+  name: string;
+  startingBalanceSol: number;
+  positionBps: number;
+  maxExposureBps: number;
+  dailyLossBps: number;
+  feeReserveSol: number;
+  tradeFeeBps: number;
+  networkFeeSol: number;
+  priorityFeeSol: number;
+  latencyMs: number;
+  latencySlippageBps: number;
+  slippageBps: number;
+  minRealSolReserves: number;
+  maxImpactBps: number;
+  maxHolderPct: number;
+  maxTop10Pct: number;
+  maxCreatorPct: number;
+  cooldownMs: number;
+  gapCooldownMs: number;
+  migrationPenaltyBps: number;
+  /** Rent deposit for the token account that a first buy creates. */
+  tokenAccountRentSol: number;
+  /** True when the sell closes the token account and returns the deposit. */
+  rentRefundedOnExit: boolean;
+  /** Entry thresholds. Anything other than the approved rules is paper-only. */
+  entryRules: Readonly<MomentumRules>;
+  /** "momentum" is the approved strategy. "early" and "midcurve" are paper-only. */
+  strategy: "momentum" | "early" | "midcurve";
+  earlyRules: Readonly<EarlyEntryRules>;
+  midCurveRules: Readonly<MidCurveRules>;
+  exitRules: Readonly<ExitRules>;
+  /** Gross profit target that every estimated cost plus margin must fit under. */
+  grossTargetBps: number;
+}
+
+export const BASE_CONFIG: Omit<PaperTraderConfig, "name" | "minRealSolReserves"> = {
+  startingBalanceSol: 10,
+  positionBps: 500,
+  maxExposureBps: 4_000,
+  dailyLossBps: 1_000,
+  feeReserveSol: 0.05,
+  tradeFeeBps: 125,
+  networkFeeSol: 0.000005,
+  priorityFeeSol: 0.0002,
+  latencyMs: 1_500,
+  latencySlippageBps: 50,
+  slippageBps: 100,
+  maxImpactBps: 200,
+  maxHolderPct: 5,
+  maxTop10Pct: 25,
+  maxCreatorPct: 5,
+  cooldownMs: 30 * 60_000,
+  gapCooldownMs: 5 * 60_000,
+  migrationPenaltyBps: 300,
+  tokenAccountRentSol: 0.00207,
+  rentRefundedOnExit: true,
+  entryRules: APPROVED_MOMENTUM_RULES,
+  strategy: "momentum",
+  earlyRules: EARLY_ENTRY_RULES,
+  midCurveRules: MID_CURVE_RULES,
+  exitRules: APPROVED_EXIT_RULES,
+  grossTargetBps: 1_500,
+};
+
+interface PendingOrder {
+  side: "buy" | "sell";
+  mint: string;
+  fillAt: number;
+  sizeSol: number;
+  tokens: number;
+  quotedOutput: number;
+  reasons: string[];
+}
+
+export interface OpenPosition {
+  mint: string;
+  symbol: string;
+  openedAt: number;
+  tokens: number;
+  entryCostSol: number;
+  entryPrice: number;
+  peakValueSol: number;
+  exiting: boolean;
+}
+
+export interface ClosedPaperTrade {
+  trader: string;
+  mint: string;
+  symbol: string;
+  openedAt: string;
+  closedAt: string;
+  holdSeconds: number;
+  entryCostSol: number;
+  exitProceedsSol: number;
+  pnlSol: number;
+  pnlPct: number;
+  exitReasons: string[];
+  failedAttempts: number;
+}
+
+export interface TraderSnapshot {
+  name: string;
+  cashSol: number;
+  equitySol: number;
+  returnPct: number;
+  openPositions: number;
+  closedTrades: number;
+  wins: number;
+  losses: number;
+  failedTransactions: number;
+  halted: boolean;
+  feesPaidSol: number;
+  rejectionCounts: Record<string, number>;
+}
+
+const LAMPORTS = 1_000_000_000;
+const toLamports = (sol: number): bigint => BigInt(Math.max(0, Math.round(sol * LAMPORTS)));
+
+export class PaperTrader {
+  cashSol: number;
+  readonly positions = new Map<string, OpenPosition>();
+  readonly closed: ClosedPaperTrade[] = [];
+  readonly equityCurve: Array<{ at: string; equitySol: number }> = [];
+  readonly rejectionCounts: Record<string, number> = {};
+  private readonly pending: PendingOrder[] = [];
+  private readonly cooldownUntil = new Map<string, number>();
+  private readonly failedAttemptsByMint = new Map<string, number>();
+  private dayKey = "";
+  private dayOpenEquity: number;
+  private halted = false;
+  failedTransactions = 0;
+  feesPaidSol = 0;
+
+  constructor(readonly config: PaperTraderConfig, private readonly market: MarketState) {
+    this.cashSol = config.startingBalanceSol;
+    this.dayOpenEquity = config.startingBalanceSol;
+  }
+
+  isActive(mint: string): boolean {
+    return this.positions.has(mint) || this.pending.some((order) => order.mint === mint);
+  }
+
+  private txFee(): number {
+    return this.config.networkFeeSol + this.config.priorityFeeSol;
+  }
+
+  private count(reason: string): void {
+    this.rejectionCounts[reason] = (this.rejectionCounts[reason] ?? 0) + 1;
+  }
+
+  /** Net SOL from selling the whole position now, after fees and latency slippage. Excludes a refundable deposit. */
+  liquidationValue(position: OpenPosition, token: TokenState | undefined): number {
+    if (!token) return 0;
+    const { solOut } = quoteSell(token.vSol, token.vTokens, position.tokens, this.config.tradeFeeBps);
+    const penalty = token.migrated ? this.config.migrationPenaltyBps : 0;
+    return Math.max(0, solOut * (1 - (this.config.latencySlippageBps + penalty) / 10_000) - this.txFee());
+  }
+
+  private rentRefund(): number {
+    return this.config.rentRefundedOnExit ? this.config.tokenAccountRentSol : 0;
+  }
+
+  equity(): number {
+    let value = this.cashSol;
+    for (const position of this.positions.values()) {
+      value += this.liquidationValue(position, this.market.tokens.get(position.mint)) + this.rentRefund();
+    }
+    return value;
+  }
+
+  /** Executes every pending order whose modeled fill time has passed, using state observed before that time. */
+  advanceTo(time: number): void {
+    for (let index = 0; index < this.pending.length;) {
+      const order = this.pending[index]!;
+      if (order.fillAt > time) {
+        index += 1;
+        continue;
+      }
+      this.pending.splice(index, 1);
+      this.fill(order);
+    }
+  }
+
+  private fill(order: PendingOrder): void {
+    const token = this.market.tokens.get(order.mint);
+    const fee = this.txFee();
+    this.cashSol -= fee;
+    this.feesPaidSol += fee;
+    if (!token) {
+      this.failedTransactions += 1;
+      return;
+    }
+    if (order.side === "buy") {
+      if (token.migrated) {
+        this.failedTransactions += 1;
+        this.count("FILL_FAILED_MIGRATED");
+        this.cashSol += order.sizeSol; // release the reservation
+        return;
+      }
+      const quote = quoteBuy(token.vSol, token.vTokens, order.sizeSol, this.config.tradeFeeBps);
+      const tokensOut = quote.tokensOut * (1 - this.config.latencySlippageBps / 10_000);
+      if (tokensOut < order.quotedOutput * (1 - this.config.slippageBps / 10_000)) {
+        // Transaction-enforced minimum output fails. Only the network fee is lost.
+        this.failedTransactions += 1;
+        this.count("FILL_FAILED_SLIPPAGE");
+        this.cashSol += order.sizeSol;
+        return;
+      }
+      this.feesPaidSol += order.sizeSol * (this.config.tradeFeeBps / 10_000);
+      this.cashSol -= this.config.tokenAccountRentSol;
+      this.positions.set(order.mint, {
+        mint: order.mint,
+        symbol: token.symbol,
+        openedAt: order.fillAt,
+        tokens: tokensOut,
+        entryCostSol: order.sizeSol + fee + (this.config.rentRefundedOnExit ? 0 : this.config.tokenAccountRentSol),
+        entryPrice: order.sizeSol / tokensOut,
+        peakValueSol: 0,
+        exiting: false,
+      });
+      return;
+    }
+
+    const position = this.positions.get(order.mint);
+    if (!position) return;
+    const { solOut } = quoteSell(token.vSol, token.vTokens, position.tokens, this.config.tradeFeeBps);
+    const penalty = token.migrated ? this.config.migrationPenaltyBps : 0;
+    const proceeds = solOut * (1 - (this.config.latencySlippageBps + penalty) / 10_000);
+    if (!token.migrated && proceeds < order.quotedOutput * (1 - this.config.slippageBps / 10_000)) {
+      this.failedTransactions += 1;
+      this.failedAttemptsByMint.set(order.mint, (this.failedAttemptsByMint.get(order.mint) ?? 0) + 1);
+      this.count("EXIT_FAILED_SLIPPAGE");
+      position.exiting = false; // re-evaluated on the next tick with a fresh quote
+      return;
+    }
+    this.feesPaidSol += (solOut / (1 - this.config.tradeFeeBps / 10_000)) * (this.config.tradeFeeBps / 10_000);
+    this.cashSol += proceeds + this.rentRefund();
+    this.positions.delete(order.mint);
+    this.cooldownUntil.set(order.mint, order.fillAt + this.config.cooldownMs);
+    const exitNet = proceeds - fee;
+    const pnl = exitNet - position.entryCostSol;
+    this.closed.push({
+      trader: this.config.name,
+      mint: order.mint,
+      symbol: position.symbol,
+      openedAt: new Date(position.openedAt).toISOString(),
+      closedAt: new Date(order.fillAt).toISOString(),
+      holdSeconds: Math.round((order.fillAt - position.openedAt) / 1000),
+      entryCostSol: position.entryCostSol,
+      exitProceedsSol: exitNet,
+      pnlSol: pnl,
+      pnlPct: (pnl / position.entryCostSol) * 100,
+      exitReasons: order.reasons,
+      failedAttempts: this.failedAttemptsByMint.get(order.mint) ?? 0,
+    });
+    this.failedAttemptsByMint.delete(order.mint);
+  }
+
+  /**
+   * Runs exits and entries at a five-second boundary. Returns mints that need an
+   * on-chain authority check before entry can be considered.
+   */
+  tick(now: number, authorities: ReadonlyMap<string, AuthorityStatus>): string[] {
+    this.advanceTo(now);
+    this.rollDay(now);
+    const equity = this.equity();
+    if (equity - this.dayOpenEquity <= -(this.dayOpenEquity * this.config.dailyLossBps) / 10_000) {
+      if (!this.halted) this.count("DAILY_LOSS_HALT");
+      this.halted = true;
+    }
+    this.evaluateExits(now);
+    if (now % 60_000 < 5_000) this.equityCurve.push({ at: new Date(now).toISOString(), equitySol: round(equity) });
+    if (this.halted) return [];
+    return this.evaluateEntries(now, equity, authorities);
+  }
+
+  private rollDay(now: number): void {
+    const key = new Date(now).toISOString().slice(0, 10);
+    if (key !== this.dayKey) {
+      this.dayKey = key;
+      this.dayOpenEquity = this.equity();
+    }
+  }
+
+  private evaluateExits(now: number): void {
+    for (const position of this.positions.values()) {
+      if (position.exiting) continue;
+      const token = this.market.tokens.get(position.mint);
+      const value = this.liquidationValue(position, token);
+      position.peakValueSol = Math.max(position.peakValueSol, value);
+      const decision = evaluateExit({
+        netExecutableValueLamports: toLamports(value),
+        entryCostLamports: toLamports(position.entryCostSol),
+        peakNetExecutableValueLamports: toLamports(position.peakValueSol),
+        openedAt: new Date(position.openedAt),
+        now: new Date(now),
+      }, this.config.exitRules);
+      const reasons: string[] = [...decision.reasons];
+      if (token?.migrated) reasons.push("ROUTE_MIGRATED");
+      if (this.halted) reasons.push("DAILY_LOSS_LIQUIDATION");
+      if (reasons.length === 0) continue;
+      position.exiting = true;
+      const quote = token ? quoteSell(token.vSol, token.vTokens, position.tokens, this.config.tradeFeeBps).solOut : 0;
+      this.pending.push({ side: "sell", mint: position.mint, fillAt: now + this.config.latencyMs, sizeSol: 0, tokens: position.tokens, quotedOutput: quote, reasons });
+    }
+  }
+
+  private evaluateEntries(now: number, equity: number, authorities: ReadonlyMap<string, AuthorityStatus>): string[] {
+    if (now - this.market.lastGapAt < this.config.gapCooldownMs) {
+      this.count("STREAM_GAP_COOLDOWN");
+      return [];
+    }
+    const needsAuthority: string[] = [];
+    const candidates: Array<{ mint: string; token: TokenState; decision?: EntryDecision; score: number }> = [];
+    for (const token of this.market.tokens.values()) {
+      if (token.migrated || this.isActive(token.mint)) continue;
+      if ((this.cooldownUntil.get(token.mint) ?? 0) > now) continue;
+      const signal = this.signal(token, now);
+      if (!signal) continue;
+      const rejection = this.safetyRejection(token);
+      if (rejection) {
+        this.count(rejection);
+        continue;
+      }
+      const authority = authorities.get(token.mint);
+      if (authority === undefined) {
+        needsAuthority.push(token.mint);
+        this.count("AUTHORITY_CHECK_PENDING");
+        continue;
+      }
+      if (authority === "reject") {
+        this.count("MINT_AUTHORITY_REJECTED");
+        continue;
+      }
+      candidates.push({ mint: token.mint, token, ...signal });
+    }
+
+    const ranked = this.config.strategy !== "momentum"
+      ? candidates.slice().sort((left, right) => right.score - left.score || left.mint.localeCompare(right.mint))
+      : rankMomentumCandidates(candidates.flatMap((candidate) => (candidate.decision ? [{ ...candidate, decision: candidate.decision }] : [])));
+    for (const candidate of ranked) {
+      const token = candidate.token;
+      const sizingEquity = Math.min(equity, this.dayOpenEquity);
+      const sizeSol = (sizingEquity * this.config.positionBps) / 10_000;
+      const buy = quoteBuy(token.vSol, token.vTokens, sizeSol, this.config.tradeFeeBps);
+      const sell = quoteSell(token.vSol + sizeSol, token.vTokens - buy.tokensOut, buy.tokensOut, this.config.tradeFeeBps);
+      if (buy.impactBps > this.config.maxImpactBps || sell.impactBps > this.config.maxImpactBps) {
+        this.count("QUOTE_PRICE_IMPACT_TOO_HIGH");
+        continue;
+      }
+      const lostRentSol = this.config.rentRefundedOnExit ? 0 : this.config.tokenAccountRentSol;
+      const txFeeBps = Math.ceil(((this.txFee() * 2 + lostRentSol) / sizeSol) * 10_000);
+      const hurdle = meetsCostHurdle({
+        entryFeeBps: this.config.tradeFeeBps,
+        exitFeeBps: this.config.tradeFeeBps,
+        entryImpactBps: buy.impactBps,
+        exitImpactBps: sell.impactBps,
+        slippageAllowanceBps: this.config.slippageBps,
+        priorityFeeBps: txFeeBps,
+        latencyCostBps: this.config.latencySlippageBps * 2,
+        grossTargetBps: this.config.grossTargetBps,
+      });
+      if (!hurdle.allowed) {
+        this.count("COST_HURDLE_NOT_MET");
+        continue;
+      }
+      const exposure = [...this.positions.values()].reduce((sum, position) => sum + position.entryCostSol, 0)
+        + this.pending.filter((order) => order.side === "buy").reduce((sum, order) => sum + order.sizeSol, 0);
+      const risk = assessEntryRisk(
+        {
+          maxPositionBps: this.config.positionBps,
+          maxDailyLossBps: this.config.dailyLossBps,
+          maxExposureBps: this.config.maxExposureBps,
+          feeReserveLamports: toLamports(this.config.feeReserveSol),
+        },
+        {
+          currentEquityLamports: toLamports(equity),
+          openingEquityLamports: toLamports(this.dayOpenEquity),
+          externalFlowsLamports: 0n,
+          availableCashLamports: toLamports(this.cashSol),
+          currentExposureLamports: toLamports(exposure),
+          unresolvedExposureLamports: 0n,
+          netPnlLamports: equity >= this.dayOpenEquity ? toLamports(equity - this.dayOpenEquity) : -toLamports(this.dayOpenEquity - equity),
+          entryHalt: this.halted,
+          executionHalt: false,
+          hasUnpriceableAsset: false,
+        },
+        {
+          principalLamports: toLamports(sizeSol) - 1n,
+          worstCaseFeesLamports: toLamports(this.txFee() * 2 + this.config.tokenAccountRentSol),
+          worstCaseSlippageLamports: toLamports((sizeSol * this.config.slippageBps) / 10_000),
+        },
+      );
+      if (!risk.allowed) {
+        for (const reason of risk.reasons) this.count(reason);
+        continue;
+      }
+      this.cashSol -= sizeSol;
+      this.count("ENTRY_SUBMITTED");
+      this.pending.push({ side: "buy", mint: token.mint, fillAt: now + this.config.latencyMs, sizeSol, tokens: 0, quotedOutput: buy.tokensOut, reasons: ["MOMENTUM_ENTRY"] });
+    }
+    return needsAuthority;
+  }
+
+  private momentumSignal(token: TokenState, now: number): { decision: EntryDecision; score: number } | undefined {
+    if (now - token.createdAt < this.config.entryRules.minimumTokenAgeMs) return undefined;
+    // Cheap prefilter: the distinct-buyer rule needs at least this many buys anyway.
+    if (countRecentBuys(token, now - 5 * 60_000) < this.config.entryRules.minDistinctBuyers5m) return undefined;
+    const window = completedBuckets(token, now);
+    const decision = evaluateMomentumEntry({
+      mint: token.mint,
+      tokenCreatedAt: new Date(token.createdAt),
+      decisionAt: new Date(window.decisionAt),
+      completedBuckets: window.buckets,
+      distinctBuyers5m: window.distinctBuyers,
+    }, this.config.entryRules);
+    if (decision.action !== "enter") {
+      for (const reason of decision.reasons) this.count(reason);
+      return undefined;
+    }
+    return { decision, score: decision.features?.volumeRatio ?? 0 };
+  }
+
+  private signal(token: TokenState, now: number): { decision?: EntryDecision; score: number } | undefined {
+    if (this.config.strategy === "early") return this.earlySignal(token, now);
+    if (this.config.strategy === "midcurve") return this.midCurveSignal(token, now);
+    return this.momentumSignal(token, now);
+  }
+
+  private midCurveSignal(token: TokenState, now: number): { score: number } | undefined {
+    const decision = evaluateMidCurveEntry(token, now, this.config.midCurveRules);
+    if (decision.action !== "enter") {
+      for (const reason of decision.reasons) this.count(reason);
+      return undefined;
+    }
+    return { score: decision.score };
+  }
+
+  private earlySignal(token: TokenState, now: number): { score: number } | undefined {
+    const age = now - token.createdAt;
+    if (age < this.config.earlyRules.minAgeMs || age > this.config.earlyRules.maxAgeMs) return undefined;
+    const decision = evaluateEarlyEntry(token, now, this.config.earlyRules);
+    if (decision.action !== "enter") {
+      for (const reason of decision.reasons) this.count(reason);
+      return undefined;
+    }
+    return { score: decision.score };
+  }
+
+  private safetyRejection(token: TokenState): string | undefined {
+    if (token.vSol - INITIAL_VIRTUAL_SOL < this.config.minRealSolReserves) return "INSUFFICIENT_EXECUTABLE_RESERVES";
+    const holders = holderProfile(token);
+    if (holders.maxHolderPct > this.config.maxHolderPct) return "HOLDER_ABOVE_5_PCT";
+    if (holders.top10Pct > this.config.maxTop10Pct) return "TOP10_ABOVE_25_PCT";
+    if (holders.creatorPct > this.config.maxCreatorPct) return "CREATOR_ABOVE_5_PCT";
+    if (token.creatorBought > 0 && token.creatorSold / token.creatorBought > 0.5) return "CREATOR_DUMPED";
+    return undefined;
+  }
+
+  snapshot(): TraderSnapshot {
+    const equity = this.equity();
+    return {
+      name: this.config.name,
+      cashSol: round(this.cashSol),
+      equitySol: round(equity),
+      returnPct: round(((equity - this.config.startingBalanceSol) / this.config.startingBalanceSol) * 100),
+      openPositions: this.positions.size,
+      closedTrades: this.closed.length,
+      wins: this.closed.filter((trade) => trade.pnlSol > 0).length,
+      losses: this.closed.filter((trade) => trade.pnlSol <= 0).length,
+      failedTransactions: this.failedTransactions,
+      halted: this.halted,
+      feesPaidSol: round(this.feesPaidSol),
+      rejectionCounts: { ...this.rejectionCounts },
+    };
+  }
+}
+
+function countRecentBuys(token: TokenState, since: number): number {
+  let count = 0;
+  for (let index = token.trades.length - 1; index >= 0; index -= 1) {
+    const trade = token.trades[index]!;
+    if (trade.at < since) break;
+    if (trade.side === "buy") count += 1;
+  }
+  return count;
+}
+
+function round(value: number): number {
+  return Math.round(value * 1e6) / 1e6;
+}
+
+/**
+ * Looser entry rules for paper observation only. They were chosen from first
+ * principles before any backtest, not fitted to recorded data.
+ */
+export const RELAXED_MOMENTUM_RULES: Readonly<MomentumRules> = Object.freeze({
+  minimumTokenAgeMs: 5 * 60_000,
+  minReturn60sBps: 200,
+  maxReturn60sBps: 2_500,
+  minReturn5mBps: 500,
+  maxReturn5mBps: 8_000,
+  minVolumeRatio: 1.5,
+  minDistinctBuyers5m: 15,
+  minBuyVolumeShareBps: 5_500,
+  maxFiveSecondReturnBps: 2_500,
+});
+
+export const LOOSE_MOMENTUM_RULES: Readonly<MomentumRules> = Object.freeze({
+  minimumTokenAgeMs: 5 * 60_000,
+  minReturn60sBps: 100,
+  maxReturn60sBps: 4_000,
+  minReturn5mBps: 300,
+  maxReturn5mBps: 15_000,
+  minVolumeRatio: 1.2,
+  minDistinctBuyers5m: 10,
+  minBuyVolumeShareBps: 5_000,
+  maxFiveSecondReturnBps: 4_000,
+});
+
+/** Faster exits for the early strategy: +25% target, -12% stop, 5 minute maximum hold. */
+export const EARLY_EXIT_RULES: Readonly<ExitRules> = Object.freeze({
+  takeProfitBps: 2_500,
+  stopLossBps: 1_200,
+  trailingActivationBps: 1_500,
+  trailingDrawdownBps: 1_000,
+  maxHoldMs: 5 * 60_000,
+});
+
+/** Wide exits for the mid-curve strategy: +50% target, -20% stop, no trailing stop, 10 minute maximum hold. */
+export const MID_CURVE_EXIT_RULES: Readonly<ExitRules> = Object.freeze({
+  takeProfitBps: 5_000,
+  stopLossBps: 2_000,
+  trailingActivationBps: 1_000_000,
+  trailingDrawdownBps: 1_000_000,
+  maxHoldMs: 10 * 60_000,
+});
+
+export function defaultVariants(startingBalanceSol = BASE_CONFIG.startingBalanceSol): PaperTraderConfig[] {
+  const base = { ...BASE_CONFIG, startingBalanceSol, feeReserveSol: Math.min(BASE_CONFIG.feeReserveSol, startingBalanceSol * 0.05) };
+  const early: Omit<PaperTraderConfig, "name"> = {
+    ...base,
+    strategy: "early",
+    minRealSolReserves: EARLY_ENTRY_RULES.minRealSol,
+    // Early tokens are thin and concentrated. These limits are wider than the approved 5% / 25% / 5%.
+    maxHolderPct: 10,
+    maxTop10Pct: 40,
+    maxCreatorPct: 10,
+    slippageBps: 200,
+    cooldownMs: 24 * 60 * 60_000,
+    exitRules: EARLY_EXIT_RULES,
+    grossTargetBps: 2_500,
+  };
+  const midCurve: Omit<PaperTraderConfig, "name"> = {
+    ...base,
+    strategy: "midcurve",
+    minRealSolReserves: MID_CURVE_RULES.minRealSol,
+    // The analysis applied no holder filter. These limits only remove extreme concentration.
+    maxHolderPct: 10,
+    maxTop10Pct: 40,
+    maxCreatorPct: 10,
+    slippageBps: 200,
+    cooldownMs: 5 * 60_000,
+    exitRules: MID_CURVE_EXIT_RULES,
+    grossTargetBps: 5_000,
+  };
+  return [
+    { ...midCurve, name: "mid-curve" },
+    {
+      ...midCurve,
+      name: "mid-curve-2x-costs",
+      latencyMs: BASE_CONFIG.latencyMs * 2,
+      latencySlippageBps: BASE_CONFIG.latencySlippageBps * 2,
+      priorityFeeSol: BASE_CONFIG.priorityFeeSol * 2,
+      migrationPenaltyBps: BASE_CONFIG.migrationPenaltyBps * 2,
+    },
+    { ...base, name: "approved-rules", minRealSolReserves: 20 },
+    { ...base, name: "relaxed-rules", minRealSolReserves: 20, entryRules: RELAXED_MOMENTUM_RULES },
+    { ...base, name: "loose-rules", minRealSolReserves: 10, entryRules: LOOSE_MOMENTUM_RULES },
+    { ...early, name: "early-entry" },
+    {
+      ...early,
+      name: "early-entry-2x-costs",
+      latencyMs: BASE_CONFIG.latencyMs * 2,
+      latencySlippageBps: BASE_CONFIG.latencySlippageBps * 2,
+      priorityFeeSol: BASE_CONFIG.priorityFeeSol * 2,
+    },
+    {
+      ...base,
+      name: "relaxed-rules-2x-costs",
+      minRealSolReserves: 20,
+      entryRules: RELAXED_MOMENTUM_RULES,
+      latencyMs: BASE_CONFIG.latencyMs * 2,
+      latencySlippageBps: BASE_CONFIG.latencySlippageBps * 2,
+      priorityFeeSol: BASE_CONFIG.priorityFeeSol * 2,
+      migrationPenaltyBps: BASE_CONFIG.migrationPenaltyBps * 2,
+    },
+  ];
+}
