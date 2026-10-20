@@ -12,6 +12,7 @@ import {
 } from "../../../packages/strategy/src/index.js";
 import { EARLY_ENTRY_RULES, type EarlyEntryRules, evaluateEarlyEntry } from "./early.js";
 import { evaluateMidCurveEntry, MID_CURVE_RULES, type MidCurveRules } from "./midcurve.js";
+import { evaluateWhaleEntry, WHALE_RULES, type WhaleRules } from "./whale.js";
 import {
   completedBuckets,
   holderProfile,
@@ -51,10 +52,11 @@ export interface PaperTraderConfig {
   rentRefundedOnExit: boolean;
   /** Entry thresholds. Anything other than the approved rules is paper-only. */
   entryRules: Readonly<MomentumRules>;
-  /** "momentum" is the approved strategy. "early" and "midcurve" are paper-only. */
-  strategy: "momentum" | "early" | "midcurve";
+  /** "momentum" is the approved strategy. "early", "midcurve", and "whale" are paper-only. */
+  strategy: "momentum" | "early" | "midcurve" | "whale";
   earlyRules: Readonly<EarlyEntryRules>;
   midCurveRules: Readonly<MidCurveRules>;
+  whaleRules: Readonly<WhaleRules>;
   exitRules: Readonly<ExitRules>;
   /** Gross profit target that every estimated cost plus margin must fit under. */
   grossTargetBps: number;
@@ -85,6 +87,7 @@ export const BASE_CONFIG: Omit<PaperTraderConfig, "name" | "minRealSolReserves">
   strategy: "momentum",
   earlyRules: EARLY_ENTRY_RULES,
   midCurveRules: MID_CURVE_RULES,
+  whaleRules: WHALE_RULES,
   exitRules: APPROVED_EXIT_RULES,
   grossTargetBps: 1_500,
 };
@@ -451,6 +454,10 @@ export class PaperTrader {
   private signal(token: TokenState, now: number): { decision?: EntryDecision; score: number } | undefined {
     if (this.config.strategy === "early") return this.earlySignal(token, now);
     if (this.config.strategy === "midcurve") return this.midCurveSignal(token, now);
+    if (this.config.strategy === "whale") {
+      const decision = evaluateWhaleEntry(token, now, this.config.whaleRules);
+      return decision.action === "enter" ? { score: decision.score } : undefined;
+    }
     return this.momentumSignal(token, now);
   }
 
@@ -563,6 +570,15 @@ export const MID_CURVE_EXIT_RULES: Readonly<ExitRules> = Object.freeze({
   maxHoldMs: 10 * 60_000,
 });
 
+/** Time exit for the whale strategy: sell after 5 minutes. The -50% stop only limits extreme losses. */
+export const WHALE_EXIT_RULES: Readonly<ExitRules> = Object.freeze({
+  takeProfitBps: 1_000_000,
+  stopLossBps: 5_000,
+  trailingActivationBps: 1_000_000,
+  trailingDrawdownBps: 1_000_000,
+  maxHoldMs: 5 * 60_000,
+});
+
 export function defaultVariants(startingBalanceSol = BASE_CONFIG.startingBalanceSol): PaperTraderConfig[] {
   const base = { ...BASE_CONFIG, startingBalanceSol, feeReserveSol: Math.min(BASE_CONFIG.feeReserveSol, startingBalanceSol * 0.05) };
   const early: Omit<PaperTraderConfig, "name"> = {
@@ -591,7 +607,28 @@ export function defaultVariants(startingBalanceSol = BASE_CONFIG.startingBalance
     exitRules: MID_CURVE_EXIT_RULES,
     grossTargetBps: 5_000,
   };
+  const whale: Omit<PaperTraderConfig, "name"> = {
+    ...base,
+    strategy: "whale",
+    minRealSolReserves: WHALE_RULES.minRealSol,
+    // The analysis applied no holder filter. The whale itself can hold a few percent of supply.
+    maxHolderPct: 10,
+    maxTop10Pct: 50,
+    maxCreatorPct: 10,
+    slippageBps: 200,
+    cooldownMs: 10 * 60_000,
+    exitRules: WHALE_EXIT_RULES,
+  };
   return [
+    { ...whale, name: "whale-late" },
+    {
+      ...whale,
+      name: "whale-late-2x-costs",
+      latencyMs: BASE_CONFIG.latencyMs * 2,
+      latencySlippageBps: BASE_CONFIG.latencySlippageBps * 2,
+      priorityFeeSol: BASE_CONFIG.priorityFeeSol * 2,
+      migrationPenaltyBps: BASE_CONFIG.migrationPenaltyBps * 2,
+    },
     { ...midCurve, name: "mid-curve" },
     {
       ...midCurve,

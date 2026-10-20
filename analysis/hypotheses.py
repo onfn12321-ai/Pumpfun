@@ -223,8 +223,10 @@ def main():
     results.sort(key=lambda r: -r["min_fold"])
     with open(os.path.join(out_dir, "results.csv"), "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(results[0].keys()) if results else ["hypothesis"]); w.writeheader(); w.writerows(results)
-    span = (all_times[-1] - all_times[0]) / 3600
-    lines = [f"# Hypothesis search", "", f"- Data: {len(tokens)} standard tokens, {len(all_times)} trades, {span:.2f} h span, {len(files)} files.",
+    # Covered hours: the sum of gaps between consecutive trades that are shorter than 5 minutes.
+    # Recording outages are not counted.
+    span = sum(b - a for a, b in zip(all_times, all_times[1:]) if b - a < 300) / 3600
+    lines = [f"# Hypothesis search", "", f"- Data: {len(tokens)} standard tokens, {len(all_times)} trades, {span:.2f} h of recorded data, {len(files)} files.",
              f"- Tested: {len(H)} triggers x {len(EXITS)} exits = {len(results)} combinations with at least {MIN_TOTAL} trades.",
              f"- Passed all checks: {sum(r['passed'] for r in results)}.", f"- Runtime: {time.time() - started:.0f} s.", "",
              "| Pass | Hypothesis | Exit | n | Mean | Median | Win | Boot p5 | Fold means % |", "|---|---|---|---|---|---|---|---|---|"]

@@ -77,6 +77,23 @@ OUTPUT_DIR=data/backtest/my-run npm run paper:backtest -- data/paper/my-run/mark
 - Only the approved rules may ever go live. The other rule sets are for paper observation.
 - A few hours of results do not satisfy the release gates and do not predict future results.
 
+## Run the paper research for days on a server
+
+The sandbox stops when it is idle, so long runs need a server that stays on. Any Ubuntu 22.04 or 24.04 server with 2 vCPU, 8 GB RAM, and 40 GB disk is enough.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/onfn12321-ai/Pumpfun/<branch>/deploy/vps/setup.sh | sudo bash -s -- <branch>
+sudo -u pumpfun /opt/pumpfun/deploy/vps/status.sh
+```
+
+`setup.sh` starts three systemd services that restart after a crash or a reboot:
+
+- `pumpfun-record`: records Pump.fun events to a new file every 6 hours and deletes files older than 14 days.
+- `pumpfun-paper`: runs a 24-hour live paper session with every paper portfolio, then starts a new one.
+- `pumpfun-research`: runs `analysis/hypotheses.py` every hour on the newest 8 recordings and writes `data/research/candidate-*.md` when a candidate passes every check.
+
+No service holds a wallet key or can send a transaction. To use a dedicated RPC, put `SOLANA_RPC_PROVIDER_KEY=<https URL>` in `/etc/pumpfun.env` and run `sudo systemctl restart pumpfun-paper`.
+
 ## Architecture
 
 - `apps/collector` normalizes permitted observations and decoded on-chain events.
